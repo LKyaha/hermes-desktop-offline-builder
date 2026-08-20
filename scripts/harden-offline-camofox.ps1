@@ -1,5 +1,7 @@
 param(
-    [Parameter(Mandatory = $true)][string]$InstallScript
+    [Parameter(Mandatory = $true)][string]$InstallScript,
+    [string]$WorkRoot = $(Join-Path (Split-Path $PSScriptRoot -Parent) 'offline-work'),
+    [string]$PayloadRoot = $(Join-Path (Split-Path $PSScriptRoot -Parent) 'offline-bundle\payload')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -7,6 +9,107 @@ if (-not (Test-Path -LiteralPath $InstallScript -PathType Leaf)) {
     throw "Generated install script not found: $InstallScript"
 }
 
+# ---------------------------------------------------------------------------
+# Materialize Camofox into the bundled Node prefix at BUILD time.
+# ---------------------------------------------------------------------------
+# npm's cache is not a reproducible package store for a later global semver
+# install: an online `npm install -g @askjo/camofox-browser@^1.5.2` can succeed
+# and populate _cacache while a fresh `npm install -g --offline` still needs
+# registry metadata that npm did not retain in a form it can resolve offline.
+# Full Offline therefore ships the already-materialized global package tree.
+# The target machine only verifies it; it never asks npm to reconstruct it.
+
+$managedRoot = Join-Path $WorkRoot 'managed-runtime'
+$nodeRoot = Join-Path $managedRoot 'node'
+$npmCache = Join-Path $WorkRoot 'npm-cache'
+$managedArchive = Join-Path $PayloadRoot 'managed-runtime.tar.gz'
+$manifestPath = Join-Path $PayloadRoot 'manifest.json'
+$npmExe = Join-Path $nodeRoot 'npm.cmd'
+
+foreach ($required in @($managedRoot, $nodeRoot, $npmCache, $PayloadRoot)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Container)) {
+        throw "Camofox payload finalization is missing build directory: $required"
+    }
+}
+if (-not (Test-Path -LiteralPath $npmExe -PathType Leaf)) {
+    throw "Bundled Node npm.cmd was not found: $npmExe"
+}
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "Offline payload manifest was not found: $manifestPath"
+}
+
+$oldCache = $env:NPM_CONFIG_CACHE
+$oldAudit = $env:NPM_CONFIG_AUDIT
+$oldFund = $env:NPM_CONFIG_FUND
+$oldOffline = $env:NPM_CONFIG_OFFLINE
+$oldPreferOffline = $env:NPM_CONFIG_PREFER_OFFLINE
+try {
+    $env:NPM_CONFIG_CACHE = $npmCache
+    $env:NPM_CONFIG_AUDIT = 'false'
+    $env:NPM_CONFIG_FUND = 'false'
+    Remove-Item Env:\NPM_CONFIG_OFFLINE -ErrorAction SilentlyContinue
+    Remove-Item Env:\NPM_CONFIG_PREFER_OFFLINE -ErrorAction SilentlyContinue
+
+    Write-Host 'Materializing Camofox into bundled managed Node runtime...'
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $npmExe install -g --prefix $nodeRoot --ignore-scripts --no-audit --no-fund '@askjo/camofox-browser@^1.5.2' 2>&1 |
+        ForEach-Object { "$_" | Write-Host }
+    $npmExit = $LASTEXITCODE
+    $ErrorActionPreference = $previousEap
+    if ($npmExit -ne 0) {
+        throw "Build-time Camofox materialization failed (npm exit $npmExit)."
+    }
+} finally {
+    $ErrorActionPreference = 'Stop'
+    if ($null -eq $oldCache) { Remove-Item Env:\NPM_CONFIG_CACHE -ErrorAction SilentlyContinue } else { $env:NPM_CONFIG_CACHE = $oldCache }
+    if ($null -eq $oldAudit) { Remove-Item Env:\NPM_CONFIG_AUDIT -ErrorAction SilentlyContinue } else { $env:NPM_CONFIG_AUDIT = $oldAudit }
+    if ($null -eq $oldFund) { Remove-Item Env:\NPM_CONFIG_FUND -ErrorAction SilentlyContinue } else { $env:NPM_CONFIG_FUND = $oldFund }
+    if ($null -eq $oldOffline) { Remove-Item Env:\NPM_CONFIG_OFFLINE -ErrorAction SilentlyContinue } else { $env:NPM_CONFIG_OFFLINE = $oldOffline }
+    if ($null -eq $oldPreferOffline) { Remove-Item Env:\NPM_CONFIG_PREFER_OFFLINE -ErrorAction SilentlyContinue } else { $env:NPM_CONFIG_PREFER_OFFLINE = $oldPreferOffline }
+}
+
+$camoPackageJson = Join-Path $nodeRoot 'node_modules\@askjo\camofox-browser\package.json'
+if (-not (Test-Path -LiteralPath $camoPackageJson -PathType Leaf)) {
+    throw "Build-time Camofox install succeeded but package.json is missing: $camoPackageJson"
+}
+$camoPackage = Get-Content -LiteralPath $camoPackageJson -Raw | ConvertFrom-Json
+if ($camoPackage.name -ne '@askjo/camofox-browser' -or [string]::IsNullOrWhiteSpace([string]$camoPackage.version)) {
+    throw 'Build-time Camofox package identity/version is invalid.'
+}
+$camofoxVersion = [string]$camoPackage.version
+Write-Host "Bundled Camofox materialized: $camofoxVersion"
+
+# prepare-offline-payload.ps1 has already created the six archives. Rebuild
+# only managed-runtime.tar.gz after adding Camofox, then refresh manifest hashes
+# so the normal hash-validation gate checks the final bytes that will ship.
+$tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+if (-not (Test-Path -LiteralPath $tarExe -PathType Leaf)) {
+    $tarCmd = Get-Command tar.exe -ErrorAction Stop
+    $tarExe = $tarCmd.Source
+}
+if (Test-Path -LiteralPath $managedArchive -PathType Leaf) {
+    Remove-Item -LiteralPath $managedArchive -Force
+}
+Write-Host 'Rebuilding managed-runtime.tar.gz with bundled Camofox...'
+& $tarExe -czf $managedArchive -C $managedRoot .
+if ($LASTEXITCODE -ne 0) { throw "tar failed while rebuilding managed-runtime.tar.gz (exit $LASTEXITCODE)" }
+
+$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+$manifest.camofox_browser = $camofoxVersion
+foreach ($entry in @($manifest.archives)) {
+    $archivePath = Join-Path $PayloadRoot $entry.name
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+        throw "Manifest archive disappeared during Camofox finalization: $($entry.name)"
+    }
+    $entry.bytes = (Get-Item -LiteralPath $archivePath).Length
+    $entry.sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+
+# ---------------------------------------------------------------------------
+# Patch the target-side installer: verify, do not npm-install, Camofox.
+# ---------------------------------------------------------------------------
 $text = [System.IO.File]::ReadAllText($InstallScript)
 $marker = '# Stage definitions -- the single source of truth.'
 $index = $text.IndexOf($marker, [System.StringComparison]::Ordinal)
@@ -18,24 +121,9 @@ $block = @'
 # ============================================================================
 # Full-offline Camofox hardening
 # ============================================================================
-# Upstream v2026.8.18 installs @askjo/camofox-browser globally under the
-# Hermes-managed Node prefix. Its generic npm timeout helper can misread a
-# successful Windows npm process, so strict offline mode performs the same
-# install directly and verifies the resulting package before node-deps passes.
-
-function Resolve-HermesOfflineCamofoxNpm {
-    $npmExe = Join-Path $HermesHome 'node\npm.cmd'
-    if (Test-Path -LiteralPath $npmExe -PathType Leaf) { return $npmExe }
-    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
-    if (-not $npm) { $npm = Get-Command npm -ErrorAction SilentlyContinue }
-    if (-not $npm) { throw 'Strict offline Camofox install requires npm, but npm was not found.' }
-    $npmExe = $npm.Source
-    if ($npmExe -like '*.ps1') {
-        $cmdSibling = Join-Path (Split-Path $npmExe -Parent) 'npm.cmd'
-        if (Test-Path -LiteralPath $cmdSibling -PathType Leaf) { $npmExe = $cmdSibling }
-    }
-    return $npmExe
-}
+# Camofox is materialized into the bundled Node prefix at build time. Target
+# machines never invoke npm for it; strict offline mode verifies the exact tree
+# extracted from managed-runtime.tar.gz.
 
 function Install-AgentBrowser {
     if (-not $script:HermesOfflineMode) {
@@ -43,38 +131,23 @@ function Install-AgentBrowser {
         return
     }
 
-    $npmExe = Resolve-HermesOfflineCamofoxNpm
-    $prefixDir = Join-Path $HermesHome 'node'
-    if (-not (Test-Path -LiteralPath $prefixDir -PathType Container)) {
-        New-Item -ItemType Directory -Path $prefixDir -Force | Out-Null
-    }
-
-    Write-Info 'Installing camofox browser server from bundled npm cache (offline)...'
-    $previousEap = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & $npmExe install -g --prefix $prefixDir --silent --ignore-scripts --offline --prefer-offline --no-audit --no-fund '@askjo/camofox-browser@^1.5.2' 2>&1 |
-            ForEach-Object { "$_" | Write-Host }
-        $npmExit = $LASTEXITCODE
-        $ErrorActionPreference = $previousEap
-        if ($npmExit -ne 0) {
-            throw "Camofox npm install failed in strict offline mode (exit $npmExit). The bundled npm cache is incomplete."
-        }
-    } finally {
-        $ErrorActionPreference = $previousEap
-    }
-
-    $packageJson = Join-Path $prefixDir 'node_modules\@askjo\camofox-browser\package.json'
+    $packageJson = Join-Path $HermesHome 'node\node_modules\@askjo\camofox-browser\package.json'
     if (-not (Test-Path -LiteralPath $packageJson -PathType Leaf)) {
-        throw "Camofox npm install returned success but package.json is missing: $packageJson"
+        throw "Bundled Camofox package is missing: $packageJson"
     }
+
     try {
         $package = Get-Content -LiteralPath $packageJson -Raw | ConvertFrom-Json
     } catch {
-        throw "Installed Camofox package.json could not be parsed: $($_.Exception.Message)"
+        throw "Bundled Camofox package.json could not be parsed: $($_.Exception.Message)"
     }
     if ($package.name -ne '@askjo/camofox-browser' -or [string]::IsNullOrWhiteSpace([string]$package.version)) {
-        throw 'Installed Camofox package identity/version is invalid.'
+        throw 'Bundled Camofox package identity/version is invalid.'
+    }
+
+    $manifest = Get-Content -LiteralPath (Join-Path $script:HermesOfflinePayload 'manifest.json') -Raw | ConvertFrom-Json
+    if ($manifest.camofox_browser -and ([string]$package.version -ne [string]$manifest.camofox_browser)) {
+        throw "Bundled Camofox version mismatch: package $($package.version), manifest $($manifest.camofox_browser)"
     }
 
     $sysBrowser = Find-SystemBrowser
@@ -82,7 +155,7 @@ function Install-AgentBrowser {
         Write-BrowserEnv -BrowserPath $sysBrowser
         Write-Info 'Explicit browser override set -- Chromium download will be skipped when agent-browser installs on demand'
     }
-    Write-Success "Camofox browser server verified ($($package.version))"
+    Write-Success "Bundled Camofox browser server verified ($($package.version))"
     Write-Success 'Agent-browser ready'
 }
 
@@ -114,8 +187,6 @@ function Install-NodeDeps {
     }
     Write-Success "Bundled Playwright Chromium verified ($($chromiumExe.FullName))"
 
-    # Unlike upstream's best-effort browser preparation path, Full Offline must
-    # fail here if Camofox cannot be reconstructed entirely from bundled data.
     Install-AgentBrowser
     Install-BrowserUseCli
     Install-CuaDriver
@@ -125,8 +196,8 @@ function Install-NodeDeps {
 
 '@
 
-# harden-offline-runtime.ps1 must have run first; its saved original browser
-# function is what keeps non-offline behavior unchanged.
+# harden-offline-runtime.ps1 must have run first; preserve the real upstream
+# browser function so non-offline invocations remain unchanged.
 if ($text -notmatch 'HermesPreHardenInstallAgentBrowser') {
     $anchor = '$script:HermesPreHardenInstallCuaDriver = (Get-Item Function:\Install-CuaDriver).ScriptBlock'
     $anchorIndex = $text.IndexOf($anchor, [System.StringComparison]::Ordinal)
@@ -141,4 +212,4 @@ if ($text -notmatch 'HermesPreHardenInstallAgentBrowser') {
 $patched = $text.Insert($index, $block)
 $utf8Bom = New-Object System.Text.UTF8Encoding $true
 [System.IO.File]::WriteAllText($InstallScript, $patched, $utf8Bom)
-Write-Host "Applied strict offline Camofox override: $InstallScript"
+Write-Host "Applied build-materialized offline Camofox override: $InstallScript"
