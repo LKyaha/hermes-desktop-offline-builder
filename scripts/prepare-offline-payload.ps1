@@ -247,7 +247,7 @@ Remove-Item $venvProbe -Recurse -Force
 Remove-Item $toolProbe -Recurse -Force
 
 # ---------------------------------------------------------------------------
-# Warm npm cache for the monorepo, browser helper package, and Playwright.
+# Warm npm cache for the monorepo, camofox global install, and Playwright.
 # ---------------------------------------------------------------------------
 $env:NPM_CONFIG_CACHE = $npmCache
 $env:NPM_CONFIG_AUDIT = 'false'
@@ -258,10 +258,22 @@ try {
     npm ci
     if ($LASTEXITCODE -ne 0) { throw 'npm ci failed while warming offline npm cache.' }
 
+    # Mirror upstream Install-AgentBrowser's actual Windows layout: a global
+    # package installed under the Hermes-managed Node prefix. Using -g here is
+    # important because npm can resolve a slightly different dependency graph
+    # for global installs; the target-side strict install must be satisfiable
+    # from this cache with --offline and no fallback network access.
     $camoProbe = Join-Path $WorkRoot 'camofox-probe'
     New-Item -ItemType Directory -Force -Path $camoProbe | Out-Null
-    npm install --prefix $camoProbe --ignore-scripts --no-save '@askjo/camofox-browser@^1.5.2'
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to warm npm cache for @askjo/camofox-browser.' }
+    npm install -g --prefix $camoProbe --ignore-scripts --no-audit --no-fund '@askjo/camofox-browser@^1.5.2'
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to warm npm cache for @askjo/camofox-browser global install.' }
+    $camoPackageJson = Join-Path $camoProbe 'node_modules\@askjo\camofox-browser\package.json'
+    if (-not (Test-Path -LiteralPath $camoPackageJson -PathType Leaf)) {
+        throw 'Camofox cache warm-up succeeded but the expected global package was not installed.'
+    }
+    $camoPackage = Get-Content -LiteralPath $camoPackageJson -Raw | ConvertFrom-Json
+    $camofoxVersion = $camoPackage.version
+    if (-not $camofoxVersion) { throw 'Could not read bundled camofox package version.' }
     Remove-Item $camoProbe -Recurse -Force
 
     npx --yes playwright install chromium
@@ -343,6 +355,7 @@ $manifest = [ordered]@{
     uv = $uvVersion
     cua_driver = $cuaVersion
     browser_use = $browserUseVersion
+    camofox_browser = $camofoxVersion
     prepared_at = (Get-Date).ToUniversalTime().ToString('o')
     archives = $archiveInfo
 }
