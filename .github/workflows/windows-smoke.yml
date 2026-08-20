@@ -1,10 +1,6 @@
 name: Windows x64 upstream build smoke
 
 on:
-  push:
-    branches: [main]
-  schedule:
-    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       hermes_ref:
