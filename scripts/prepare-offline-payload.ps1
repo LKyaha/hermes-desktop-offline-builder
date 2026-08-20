@@ -38,8 +38,9 @@ $npmCache = Join-Path $WorkRoot 'npm-cache'
 $playwrightRoot = Join-Path $WorkRoot 'ms-playwright'
 $venvProbe = Join-Path $WorkRoot 'venv-probe'
 $sourceStage = Join-Path $WorkRoot 'source-stage'
+$toolProbe = Join-Path $WorkRoot 'uv-tool-probe'
 
-foreach ($p in @($managed, $uvCache, $npmCache, $playwrightRoot, $venvProbe, $sourceStage)) {
+foreach ($p in @($managed, $uvCache, $npmCache, $playwrightRoot, $venvProbe, $sourceStage, $toolProbe)) {
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $managed 'bin') | Out-Null
@@ -69,7 +70,7 @@ Copy-Item $uvExe.FullName (Join-Path $managed 'bin\uv.exe') -Force
 Remove-Item $uvZip -Force
 Remove-Item $uvExtract -Recurse -Force
 $uv = Join-Path $managed 'bin\uv.exe'
-& $uv --version
+$uvVersion = (& $uv --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Bundled uv.exe failed to execute.' }
 
 # ---------------------------------------------------------------------------
@@ -101,7 +102,7 @@ if (-not $nodeDir -or -not (Test-Path (Join-Path $nodeDir.FullName 'node.exe')))
 Copy-Item $nodeDir.FullName (Join-Path $managed 'node') -Recurse -Force
 Remove-Item $nodeZip -Force
 Remove-Item $nodeExtract -Recurse -Force
-& (Join-Path $managed 'node\node.exe') --version
+$nodeVersion = (& (Join-Path $managed 'node\node.exe') --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Bundled Node.js failed to execute.' }
 
 # ---------------------------------------------------------------------------
@@ -123,8 +124,7 @@ if (-not (Test-Path $gitExe) -or -not (Test-Path $bashExe)) { throw 'PortableGit
 if ($LASTEXITCODE -ne 0) { throw 'Bundled PortableGit failed to execute.' }
 
 # ---------------------------------------------------------------------------
-# ripgrep + FFmpeg. Both archives include their redistribution notices; retain
-# those under tools\licenses in the payload.
+# ripgrep + FFmpeg. These are placed on Hermes' managed tools PATH.
 # ---------------------------------------------------------------------------
 $rgRelease = Invoke-RestMethod -Headers $publicHeaders -Uri 'https://api.github.com/repos/BurntSushi/ripgrep/releases/latest'
 $rgAsset = $rgRelease.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
@@ -158,9 +158,39 @@ Remove-Item $ffmpegZip -Force
 Remove-Item $ffmpegExtract -Recurse -Force
 
 # ---------------------------------------------------------------------------
-# Warm uv's cache by performing the exact Tier-0 install upstream uses. This is
-# our strongest offline guarantee: if the locked environment cannot be fully
-# materialised on Windows x64 during build, the bundle is rejected here.
+# cua-driver. Hermes' upstream installer currently fetches trycua's installer
+# at runtime. For a true offline install, parse that installer's baked stable
+# version during the build and ship its Windows x64 binaries directly on the
+# managed PATH. Upstream Install-CuaDriver then sees a compatible existing
+# driver and skips its network installer.
+# ---------------------------------------------------------------------------
+$cuaInstallerUrl = 'https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1'
+$cuaInstallerText = (Invoke-WebRequest -Headers $publicHeaders -Uri $cuaInstallerUrl -UseBasicParsing).Content
+$cuaVersionMatch = [regex]::Match($cuaInstallerText, '\$Script:CuaDriverRsBakedVersion\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
+if (-not $cuaVersionMatch.Success) { throw 'Could not parse cua-driver baked stable version.' }
+$cuaVersion = $cuaVersionMatch.Groups[1].Value
+$cuaTag = "cua-driver-rs-v$cuaVersion"
+$cuaZipName = "cua-driver-rs-$cuaVersion-windows-x86_64.zip"
+$cuaZip = Join-Path $WorkRoot $cuaZipName
+$cuaExtract = Join-Path $WorkRoot 'cua-driver-extract'
+Download "https://github.com/trycua/cua/releases/download/$cuaTag/$cuaZipName" $cuaZip
+Expand-Archive $cuaZip $cuaExtract -Force
+$cuaExe = Get-ChildItem $cuaExtract -Recurse -Filter cua-driver.exe | Select-Object -First 1
+if (-not $cuaExe) { throw 'cua-driver archive did not contain cua-driver.exe.' }
+Copy-Item $cuaExe.FullName (Join-Path $managed 'tools\bin\cua-driver.exe') -Force
+$cuaTheme = Get-ChildItem $cuaExtract -Recurse -Filter cua-cursor-theme.exe | Select-Object -First 1
+if ($cuaTheme) { Copy-Item $cuaTheme.FullName (Join-Path $managed 'tools\bin\cua-cursor-theme.exe') -Force }
+Get-ChildItem $cuaExtract -Recurse -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE)' } | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $managed ('tools\licenses\cua-driver-' + $_.Name)) -Force
+}
+& (Join-Path $managed 'tools\bin\cua-driver.exe') --version
+if ($LASTEXITCODE -ne 0) { throw 'Bundled cua-driver failed to execute.' }
+Remove-Item $cuaZip -Force
+Remove-Item $cuaExtract -Recurse -Force
+
+# ---------------------------------------------------------------------------
+# Warm uv's cache by performing the exact Tier-0 install upstream uses, then
+# eagerly cache the extra stacks that Desktop itself installs later.
 # ---------------------------------------------------------------------------
 $env:UV_CACHE_DIR = $uvCache
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $managed 'python'
@@ -174,10 +204,33 @@ try {
     if (-not (Test-Path $probePython)) { throw 'uv cache warm-up did not create a probe venv.' }
     & $probePython -c 'import dotenv, openai, rich, prompt_toolkit, fastapi, uvicorn'
     if ($LASTEXITCODE -ne 0) { throw 'Python baseline import probe failed after cache warm-up.' }
+
+    & $uv pip install --python $probePython -e '.[wake,voice]'
+    if ($LASTEXITCODE -ne 0) { throw 'Could not cache Desktop wake/voice dependencies.' }
+    & $probePython -c 'import onnxruntime, faster_whisper, sounddevice, openwakeword'
+    if ($LASTEXITCODE -ne 0) { throw 'Wake/voice import probe failed after cache warm-up.' }
+
+    # Warm the uv tool cache for the exact command upstream runs. The tool
+    # environment itself is disposable; on the target, UV_OFFLINE recreates it
+    # correctly at the user's paths from this cache.
+    Remove-Item Env:\UV_PROJECT_ENVIRONMENT -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path (Join-Path $toolProbe 'bin') | Out-Null
+    $env:UV_TOOL_DIR = Join-Path $toolProbe 'tools'
+    $env:UV_TOOL_BIN_DIR = Join-Path $toolProbe 'bin'
+    $env:UV_PYTHON = $pythonProbe
+    & $uv tool install browser-use --force
+    if ($LASTEXITCODE -ne 0) { throw 'Could not warm uv cache for browser-use CLI.' }
+    $browserUseExe = Join-Path $toolProbe 'bin\browser-use.exe'
+    if (-not (Test-Path $browserUseExe -PathType Leaf)) { throw 'browser-use tool install did not create browser-use.exe.' }
+    $browserUseVersion = (& $browserUseExe --version 2>&1 | Out-String).Trim()
 } finally {
     Pop-Location
+    Remove-Item Env:\UV_TOOL_DIR -ErrorAction SilentlyContinue
+    Remove-Item Env:\UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue
+    Remove-Item Env:\UV_PYTHON -ErrorAction SilentlyContinue
 }
 Remove-Item $venvProbe -Recurse -Force
+Remove-Item $toolProbe -Recurse -Force
 
 # ---------------------------------------------------------------------------
 # Warm npm cache for the monorepo, browser helper package, and Playwright.
@@ -191,8 +244,6 @@ try {
     npm ci
     if ($LASTEXITCODE -ne 0) { throw 'npm ci failed while warming offline npm cache.' }
 
-    # install.ps1 installs this package independently of the workspace. Warm its
-    # package + transitive tarballs explicitly, then discard the probe tree.
     $camoProbe = Join-Path $WorkRoot 'camofox-probe'
     New-Item -ItemType Directory -Force -Path $camoProbe | Out-Null
     npm install --prefix $camoProbe --ignore-scripts --no-save '@askjo/camofox-browser@^1.5.2'
@@ -209,8 +260,6 @@ if (-not (Get-ChildItem $playwrightRoot -Directory -ErrorAction SilentlyContinue
     throw 'Playwright reported success but no browser payload was created.'
 }
 
-# The full Desktop build is expected to have run before this script. Verify it
-# and archive it separately so the target machine never compiles Electron.
 $desktopDir = Join-Path $UpstreamRoot 'apps\desktop\release\win-unpacked'
 if (-not (Test-Path (Join-Path $desktopDir 'Hermes.exe'))) {
     throw "Prebuilt Desktop is missing: $desktopDir\Hermes.exe"
@@ -275,8 +324,11 @@ $manifest = [ordered]@{
     arch = 'x64'
     python = $pythonVersion
     node_major = $nodeMajor
+    node = $nodeVersion
     git = $gitTag
-    uv = (& $uv --version | Out-String).Trim()
+    uv = $uvVersion
+    cua_driver = $cuaVersion
+    browser_use = $browserUseVersion
     prepared_at = (Get-Date).ToUniversalTime().ToString('o')
     archives = $archiveInfo
 }
