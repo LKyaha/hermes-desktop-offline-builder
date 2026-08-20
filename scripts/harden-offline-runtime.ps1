@@ -17,7 +17,7 @@ if ($index -lt 0) {
 
 $block = @'
 # ============================================================================
-# Hermes Desktop Offline Builder strict runtime overrides (v2)
+# Hermes Desktop Offline Builder strict runtime overrides (v3)
 # ============================================================================
 # These definitions are intentionally placed immediately before the upstream
 # stage table, so they are the implementations invoked by the official stage
@@ -53,11 +53,6 @@ function Invoke-HermesOfflineNpmInstall {
     Push-Location $Directory
     $previousEap = $ErrorActionPreference
     try {
-        # Do not use upstream _Invoke-NativeWithTimeout here. On GitHub's
-        # Windows Server 2025 runner Start-Process has been observed to return a
-        # completed Process whose ExitCode property is blank, causing a real
-        # npm exit 0 to be reported as failure. A direct invocation gives us
-        # PowerShell's reliable $LASTEXITCODE and streams output naturally.
         $ErrorActionPreference = 'Continue'
         & $npmExe install --offline --prefer-offline --no-audit --no-fund 2>&1 | ForEach-Object { "$_" | Write-Host }
         $npmExit = $LASTEXITCODE
@@ -79,36 +74,59 @@ function Get-HermesOfflineCuaContractStatus {
     $version = $null
     $manifest = $null
 
+    # cua-driver prints a first-run telemetry notice to stdout by default.
+    # Hermes itself disables driver telemetry by setting this environment
+    # variable before spawning the driver. Do the same during installer probes
+    # so `manifest` remains a machine-readable JSON command.
+    $previousTelemetry = $env:CUA_DRIVER_RS_TELEMETRY_ENABLED
+    $env:CUA_DRIVER_RS_TELEMETRY_ENABLED = '0'
     try {
-        $versionOutput = (& $DriverPath --version 2>$null | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0) {
-            $issues.Add("--version exited $LASTEXITCODE")
-        } else {
-            $versionMatch = [regex]::Match($versionOutput, '(\d+\.\d+\.\d+)')
-            if (-not $versionMatch.Success) {
-                $issues.Add("--version did not contain semver: $versionOutput")
+        try {
+            $versionOutput = (& $DriverPath --version 2>$null | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+                $issues.Add("--version exited $LASTEXITCODE")
             } else {
-                $version = $versionMatch.Groups[1].Value
-                if ([version]$version -lt [version]'0.20.0') {
-                    $issues.Add("version $version is below Hermes minimum 0.20.0")
+                $versionMatch = [regex]::Match($versionOutput, '(\d+\.\d+\.\d+)')
+                if (-not $versionMatch.Success) {
+                    $issues.Add("--version did not contain semver: $versionOutput")
+                } else {
+                    $version = $versionMatch.Groups[1].Value
+                    if ([version]$version -lt [version]'0.20.0') {
+                        $issues.Add("version $version is below Hermes minimum 0.20.0")
+                    }
                 }
             }
+        } catch {
+            $issues.Add("--version could not run: $($_.Exception.Message)")
         }
-    } catch {
-        $issues.Add("--version could not run: $($_.Exception.Message)")
-    }
 
-    try {
-        $manifestText = (& $DriverPath manifest 2>$null | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0) {
-            $issues.Add("manifest exited $LASTEXITCODE")
-        } elseif (-not $manifestText) {
-            $issues.Add('manifest returned no JSON')
-        } else {
-            $manifest = $manifestText | ConvertFrom-Json
+        try {
+            $manifestRaw = (& $DriverPath manifest 2>$null | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+                $issues.Add("manifest exited $LASTEXITCODE")
+            } elseif (-not $manifestRaw) {
+                $issues.Add('manifest returned no JSON')
+            } else {
+                # Be defensive against any future informational banner: parse
+                # the JSON object itself instead of assuming stdout is pristine.
+                $jsonStart = $manifestRaw.IndexOf('{')
+                $jsonEnd = $manifestRaw.LastIndexOf('}')
+                if ($jsonStart -lt 0 -or $jsonEnd -lt $jsonStart) {
+                    $issues.Add("manifest output contained no JSON object: $manifestRaw")
+                } else {
+                    $manifestText = $manifestRaw.Substring($jsonStart, $jsonEnd - $jsonStart + 1)
+                    $manifest = $manifestText | ConvertFrom-Json
+                }
+            }
+        } catch {
+            $issues.Add("manifest JSON could not be parsed: $($_.Exception.Message)")
         }
-    } catch {
-        $issues.Add("manifest JSON could not be parsed: $($_.Exception.Message)")
+    } finally {
+        if ($null -eq $previousTelemetry) {
+            Remove-Item Env:\CUA_DRIVER_RS_TELEMETRY_ENABLED -ErrorAction SilentlyContinue
+        } else {
+            $env:CUA_DRIVER_RS_TELEMETRY_ENABLED = $previousTelemetry
+        }
     }
 
     if ($manifest) {
@@ -169,12 +187,14 @@ function Install-CuaDriver {
         throw "Bundled cua-driver failed the Hermes runtime contract: $($status.Issues -join '; ')"
     }
 
-    # Compare with the upstream PowerShell probe for diagnostics, but use the
-    # explicit field-by-field validation above as the authority. This avoids a
-    # false negative in the installer helper while still refusing binaries that
-    # omit any field Hermes' own tests require.
     $upstreamAccepted = $false
+    $previousTelemetry = $env:CUA_DRIVER_RS_TELEMETRY_ENABLED
+    $env:CUA_DRIVER_RS_TELEMETRY_ENABLED = '0'
     try { $upstreamAccepted = Test-CuaDriverRuntimeContract -DriverPath $driverPath } catch { }
+    finally {
+        if ($null -eq $previousTelemetry) { Remove-Item Env:\CUA_DRIVER_RS_TELEMETRY_ENABLED -ErrorAction SilentlyContinue }
+        else { $env:CUA_DRIVER_RS_TELEMETRY_ENABLED = $previousTelemetry }
+    }
     if (-not $upstreamAccepted) {
         Write-Warn "Upstream Test-CuaDriverRuntimeContract returned false for cua-driver $($status.Version), but the exact Hermes-required manifest contract passed; continuing with the validated bundled binary."
     }
@@ -191,17 +211,12 @@ function Install-NodeDeps {
     $node = Get-Command node -ErrorAction SilentlyContinue
     if (-not $node) { throw 'Offline Node dependency stage cannot find node.exe.' }
 
-    # Mirror the official Windows stage's two npm install locations, but with
-    # npm explicitly locked to its bundled cache and direct exit-code handling.
     Invoke-HermesOfflineNpmInstall -Label 'Browser/root' -Directory $InstallDir
     $tuiDir = Join-Path $InstallDir 'ui-tui'
     if (Test-Path -LiteralPath (Join-Path $tuiDir 'package.json') -PathType Leaf) {
         Invoke-HermesOfflineNpmInstall -Label 'TUI' -Directory $tuiDir
     }
 
-    # Playwright is pre-downloaded during payload construction. Do not run
-    # `npx playwright install` on the target; validate the bundled browser tree
-    # instead so a missing browser is a build failure, not a first-use download.
     $browserRoot = $env:PLAYWRIGHT_BROWSERS_PATH
     if (-not $browserRoot -or -not (Test-Path -LiteralPath $browserRoot -PathType Container)) {
         throw 'PLAYWRIGHT_BROWSERS_PATH does not point at the bundled browser payload.'
@@ -214,9 +229,6 @@ function Install-NodeDeps {
     }
     Write-Success "Bundled Playwright Chromium verified ($($chromiumExe.FullName))"
 
-    # Preserve optional browser environment setup/camofox preparation where the
-    # upstream function exists. It is best-effort upstream; Browser Use and CUA
-    # below are strict because the Full package promises them ready offline.
     $agentBrowserFn = Get-Command Install-AgentBrowser -CommandType Function -ErrorAction SilentlyContinue
     if ($agentBrowserFn) {
         try { Install-AgentBrowser } catch { Write-Warn "Install-AgentBrowser offline preparation warning: $($_.Exception.Message)" }
