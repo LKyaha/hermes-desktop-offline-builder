@@ -113,14 +113,16 @@ jobs:
             -HermesRef '${{ steps.upstream.outputs.ref }}' `
             -HermesCommit "$env:HERMES_COMMIT"
 
-      - name: Generate offline install.ps1 adapter
+      - name: Generate and harden offline install.ps1 adapter
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $offlineScript = "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1"
           ./scripts/make-offline-install-script.ps1 `
             -UpstreamInstallScript "$env:GITHUB_WORKSPACE/upstream/scripts/install.ps1" `
-            -OutputScript "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1" `
+            -OutputScript $offlineScript `
             -HermesCommit "$env:HERMES_COMMIT"
+          ./scripts/harden-offline-runtime.ps1 -InstallScript $offlineScript
 
       - name: Validate payload archive hashes
         shell: pwsh
