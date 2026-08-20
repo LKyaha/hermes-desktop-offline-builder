@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: windows-2025
+    runs-on: windows-latest
     timeout-minutes: 90
 
     steps:
@@ -47,6 +47,8 @@ jobs:
             }
           }
           "ref=$ref" >> $env:GITHUB_OUTPUT
+          $safeRef = $ref -replace '[\\/:*?"<>|]', '-'
+          "safe_ref=$safeRef" >> $env:GITHUB_OUTPUT
           Write-Host "Using upstream ref: $ref"
 
       - name: Clone Hermes upstream
@@ -61,10 +63,10 @@ jobs:
           "HERMES_COMMIT=$sha" >> $env:GITHUB_ENV
           Write-Host "Hermes commit: $sha"
 
-      - name: Setup Node 22
+      - name: Setup Node 22.22
         uses: actions/setup-node@v4
         with:
-          node-version: '22.23.0'
+          node-version: '22.22.0'
           cache: npm
           cache-dependency-path: upstream/package-lock.json
 
@@ -80,43 +82,73 @@ jobs:
         shell: pwsh
         env:
           npm_config_engine_strict: 'false'
-        run: npm ci
+        run: |
+          $ErrorActionPreference = 'Continue'
+          npm ci
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Warning "npm ci failed with exit $code; retrying with npm install to mirror the official installer fallback."
+            npm install
+            $code = $LASTEXITCODE
+          }
+          if ($code -ne 0) {
+            throw "Workspace dependency installation failed with exit $code"
+          }
 
-      - name: Build official Hermes Desktop NSIS
+      - name: Build Hermes Desktop using official bootstrap path
         working-directory: upstream/apps/desktop
         shell: pwsh
         env:
           npm_config_engine_strict: 'false'
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npm run dist:win:nsis
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run pack
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm run pack failed with exit $LASTEXITCODE"
+          }
+
+      - name: Verify unpacked Hermes executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem 'upstream/apps/desktop/release/*-unpacked/Hermes.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host 'Release directory contents:'
+            Get-ChildItem 'upstream/apps/desktop/release' -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+            throw 'Desktop build completed but no Hermes.exe was found under release/*-unpacked/.'
+          }
+          "HERMES_DESKTOP_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
+          "HERMES_DESKTOP_DIR=$($exe.Directory.FullName)" >> $env:GITHUB_ENV
+          Write-Host "Hermes desktop executable: $($exe.FullName)"
 
       - name: Collect smoke artifact
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          $exe = Get-ChildItem 'upstream/apps/desktop/release/*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $exe) { throw 'No Windows desktop EXE was produced.' }
-          Copy-Item $exe.FullName 'out/'
+          $zip = "out/Hermes-Desktop-${{ steps.upstream.outputs.safe_ref }}-win-x64-unpacked.zip"
+          Compress-Archive -Path "$env:HERMES_DESKTOP_DIR/*" -DestinationPath $zip -CompressionLevel Optimal
+
           $info = [ordered]@{
             upstream = 'NousResearch/hermes-agent'
             ref = '${{ steps.upstream.outputs.ref }}'
             commit = $env:HERMES_COMMIT
             platform = 'windows'
             arch = 'x64'
+            build_mode = 'npm run pack / electron-builder --dir'
             purpose = 'upstream desktop build smoke test; not the final offline installer'
           }
           $info | ConvertTo-Json | Set-Content -Encoding UTF8 'out/build-info.json'
-          Get-ChildItem out/* | ForEach-Object {
-            if (-not $_.PSIsContainer) {
-              $hash = Get-FileHash $_.FullName -Algorithm SHA256
-              "$($hash.Hash)  $($_.Name)" | Add-Content 'out/SHA256SUMS.txt'
-            }
+
+          Get-ChildItem out/* | Where-Object { -not $_.PSIsContainer -and $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($hash.Hash)  $($_.Name)" | Add-Content 'out/SHA256SUMS.txt'
           }
 
       - name: Upload smoke artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hermes-windows-x64-upstream-smoke-${{ steps.upstream.outputs.ref }}
+          name: hermes-windows-x64-upstream-smoke-${{ steps.upstream.outputs.safe_ref }}
           path: out/*
           retention-days: 7
