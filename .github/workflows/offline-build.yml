@@ -104,8 +104,6 @@ jobs:
 
       - name: Prepare complete offline payload
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           ./scripts/prepare-offline-payload.ps1 `
@@ -153,7 +151,6 @@ jobs:
           if (Test-Path $testHome) { Remove-Item $testHome -Recurse -Force }
           $script = "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1"
 
-          # Ask the generated script for the same manifest consumed by the GUI.
           $manifestJson = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
             -Manifest -IncludeDesktop -Commit "$env:HERMES_COMMIT" -Branch main `
             -HermesHome $testHome -InstallDir "$testHome/hermes-agent"
@@ -162,17 +159,13 @@ jobs:
           Write-Host "Stage protocol version: $($stageManifest.protocol_version)"
           Write-Host "Stages: $(($stageManifest.stages.name) -join ', ')"
 
-          # Run the exact upstream stage protocol one stage/process at a time,
-          # matching the Tauri Bootstrap driver's execution model.
           foreach ($stage in $stageManifest.stages) {
             Write-Host "===== OFFLINE TEST STAGE: $($stage.name) ====="
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
               -Stage $stage.name -IncludeDesktop -NonInteractive -Json `
               -Commit "$env:HERMES_COMMIT" -Branch main `
               -HermesHome $testHome -InstallDir "$testHome/hermes-agent"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Offline stage failed: $($stage.name)"
-            }
+            if ($LASTEXITCODE -ne 0) { throw "Offline stage failed: $($stage.name)" }
           }
 
           $desktop = "$testHome/hermes-agent/apps/desktop/release/win-unpacked/Hermes.exe"
@@ -184,9 +177,6 @@ jobs:
           & $python -c 'import dotenv, openai, rich, prompt_toolkit, fastapi, uvicorn'
           if ($LASTEXITCODE -ne 0) { throw 'Post-install Python import validation failed.' }
           Write-Host 'Offline stage-protocol test passed.'
-
-          # The test install duplicates the compressed payload on disk. Free it
-          # before Rust/NSIS compilation to stay inside hosted-runner disk limits.
           Remove-Item $testHome -Recurse -Force
 
       - name: Build official Hermes Bootstrap frontend
@@ -196,27 +186,20 @@ jobs:
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Bootstrap frontend build failed.' }
 
-      - name: Free Node build tree before Rust compile
+      - name: Free build trees before Rust compile
         shell: pwsh
         run: |
-          # The payload is already frozen. Cargo does not need node_modules after
-          # Vite emitted apps/bootstrap-installer/dist.
-          if (Test-Path 'upstream/node_modules') {
-            Remove-Item 'upstream/node_modules' -Recurse -Force
-          }
-          if (Test-Path 'offline-work') {
-            Remove-Item 'offline-work' -Recurse -Force
-          }
+          if (Test-Path 'upstream/node_modules') { Remove-Item 'upstream/node_modules' -Recurse -Force }
+          if (Test-Path 'offline-work') { Remove-Item 'offline-work' -Recurse -Force }
           Get-PSDrive -Name D,C | Select-Object Name, Free, Used | Format-Table -AutoSize
 
       - name: Build official Hermes Bootstrap executable
         working-directory: upstream/apps/bootstrap-installer
         shell: pwsh
-        env:
-          HERMES_BUILD_PIN_COMMIT: ${{ env.HERMES_COMMIT }}
-          HERMES_BUILD_PIN_BRANCH: main
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:HERMES_BUILD_PIN_COMMIT = $env:HERMES_COMMIT
+          $env:HERMES_BUILD_PIN_BRANCH = 'main'
           rustc --version
           cargo --version
           cargo build --release --manifest-path src-tauri/Cargo.toml
@@ -239,13 +222,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue
-          if (-not $makensis) {
-            choco install nsis -y --no-progress
-          }
-          $paths = @(
-            'C:\Program Files (x86)\NSIS\makensis.exe',
-            'C:\Program Files\NSIS\makensis.exe'
-          )
+          if (-not $makensis) { choco install nsis -y --no-progress }
+          $paths = @('C:\Program Files (x86)\NSIS\makensis.exe', 'C:\Program Files\NSIS\makensis.exe')
           $makensis = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $makensis) {
             $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
