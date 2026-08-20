@@ -1,0 +1,2 @@
+This file exists only to trigger the full-offline GitHub Actions workflow after CI/installer fixes.
+Last trigger reason: verify Windows bsdtar fix and continue full offline stage-protocol validation.
