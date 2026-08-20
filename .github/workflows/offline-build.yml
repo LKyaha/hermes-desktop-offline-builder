@@ -1,0 +1,289 @@
+name: Windows x64 full offline build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/offline-build.yml'
+      - 'scripts/**'
+      - 'installer/**'
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: 'Optional upstream tag / branch / commit'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-full-offline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream Hermes ref
+        id: upstream
+        shell: pwsh
+        env:
+          REQUESTED_REF: ${{ github.event.inputs.hermes_ref }}
+          GH_TOKEN_LOCAL: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ref = $env:REQUESTED_REF
+          if ([string]::IsNullOrWhiteSpace($ref)) {
+            $headers = @{
+              'User-Agent' = 'hermes-desktop-offline-builder'
+              'Authorization' = "Bearer $env:GH_TOKEN_LOCAL"
+              'Accept' = 'application/vnd.github+json'
+            }
+            $release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/NousResearch/hermes-agent/releases/latest'
+            $ref = $release.tag_name
+          }
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+          $safeRef = $ref -replace '[\\/:*?"<>|]', '-'
+          "safe_ref=$safeRef" >> $env:GITHUB_OUTPUT
+          Write-Host "Using upstream ref: $ref"
+
+      - name: Clone Hermes upstream
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git upstream
+          Set-Location upstream
+          git fetch --tags --force
+          git checkout '${{ steps.upstream.outputs.ref }}'
+          $sha = (git rev-parse HEAD).Trim()
+          "HERMES_COMMIT=$sha" >> $env:GITHUB_ENV
+          Write-Host "Hermes commit: $sha"
+
+      - name: Setup Node 22.22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.0'
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+
+      - name: Install upstream workspace dependencies
+        working-directory: upstream
+        shell: pwsh
+        env:
+          npm_config_engine_strict: 'false'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          npm ci
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Warning "npm ci failed with exit $code; retrying with npm install like upstream install.ps1."
+            npm install
+            $code = $LASTEXITCODE
+          }
+          if ($code -ne 0) { throw "Workspace dependency installation failed with exit $code" }
+
+      - name: Build official Hermes Desktop unpacked app
+        working-directory: upstream/apps/desktop
+        shell: pwsh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          npm_config_engine_strict: 'false'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run pack
+          if ($LASTEXITCODE -ne 0) { throw "npm run pack failed with exit $LASTEXITCODE" }
+          if (-not (Test-Path 'release/win-unpacked/Hermes.exe')) {
+            throw 'Official Desktop build did not produce release/win-unpacked/Hermes.exe'
+          }
+
+      - name: Prepare complete offline payload
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/prepare-offline-payload.ps1 `
+            -UpstreamRoot "$env:GITHUB_WORKSPACE/upstream" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/offline-work" `
+            -PayloadRoot "$env:GITHUB_WORKSPACE/offline-bundle/payload" `
+            -HermesRef '${{ steps.upstream.outputs.ref }}' `
+            -HermesCommit "$env:HERMES_COMMIT"
+
+      - name: Generate offline install.ps1 adapter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/make-offline-install-script.ps1 `
+            -UpstreamInstallScript "$env:GITHUB_WORKSPACE/upstream/scripts/install.ps1" `
+            -OutputScript "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1" `
+            -HermesCommit "$env:HERMES_COMMIT"
+
+      - name: Validate payload archive hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payload = "$env:GITHUB_WORKSPACE/offline-bundle/payload"
+          $manifest = Get-Content "$payload/manifest.json" -Raw | ConvertFrom-Json
+          foreach ($entry in $manifest.archives) {
+            $path = Join-Path $payload $entry.name
+            if (-not (Test-Path $path)) { throw "Manifest archive missing: $($entry.name)" }
+            $actual = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $entry.sha256) { throw "SHA256 mismatch for $($entry.name)" }
+          }
+          Write-Host "Validated $($manifest.archives.Count) payload archive hashes."
+
+      - name: Offline stage-protocol installation test
+        shell: pwsh
+        env:
+          HERMES_OFFLINE_PAYLOAD: ${{ github.workspace }}\offline-bundle\payload
+          HERMES_OFFLINE_STRICT: '1'
+          HTTP_PROXY: 'http://127.0.0.1:9'
+          HTTPS_PROXY: 'http://127.0.0.1:9'
+          ALL_PROXY: 'http://127.0.0.1:9'
+          NO_PROXY: '127.0.0.1,localhost'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testHome = "$env:GITHUB_WORKSPACE/offline-test-home"
+          if (Test-Path $testHome) { Remove-Item $testHome -Recurse -Force }
+          $script = "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1"
+
+          # Ask the generated script for the same manifest consumed by the GUI.
+          $manifestJson = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
+            -Manifest -IncludeDesktop -Commit "$env:HERMES_COMMIT" -Branch main `
+            -HermesHome $testHome -InstallDir "$testHome/hermes-agent"
+          if ($LASTEXITCODE -ne 0) { throw 'Offline install script manifest failed.' }
+          $stageManifest = ($manifestJson | Out-String | ConvertFrom-Json)
+          Write-Host "Stage protocol version: $($stageManifest.protocol_version)"
+          Write-Host "Stages: $(($stageManifest.stages.name) -join ', ')"
+
+          # Run the exact upstream stage protocol one stage/process at a time,
+          # matching the Tauri Bootstrap driver's execution model.
+          foreach ($stage in $stageManifest.stages) {
+            Write-Host "===== OFFLINE TEST STAGE: $($stage.name) ====="
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
+              -Stage $stage.name -IncludeDesktop -NonInteractive -Json `
+              -Commit "$env:HERMES_COMMIT" -Branch main `
+              -HermesHome $testHome -InstallDir "$testHome/hermes-agent"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Offline stage failed: $($stage.name)"
+            }
+          }
+
+          $desktop = "$testHome/hermes-agent/apps/desktop/release/win-unpacked/Hermes.exe"
+          $python = "$testHome/hermes-agent/venv/Scripts/python.exe"
+          $hermes = "$testHome/hermes-agent/venv/Scripts/hermes.exe"
+          foreach ($required in @($desktop, $python, $hermes)) {
+            if (-not (Test-Path $required -PathType Leaf)) { throw "Offline install missing required file: $required" }
+          }
+          & $python -c 'import dotenv, openai, rich, prompt_toolkit, fastapi, uvicorn'
+          if ($LASTEXITCODE -ne 0) { throw 'Post-install Python import validation failed.' }
+          Write-Host 'Offline stage-protocol test passed.'
+
+          # The test install duplicates the compressed payload on disk. Free it
+          # before Rust/NSIS compilation to stay inside hosted-runner disk limits.
+          Remove-Item $testHome -Recurse -Force
+
+      - name: Build official Hermes Bootstrap frontend
+        working-directory: upstream/apps/bootstrap-installer
+        shell: pwsh
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Bootstrap frontend build failed.' }
+
+      - name: Free Node build tree before Rust compile
+        shell: pwsh
+        run: |
+          # The payload is already frozen. Cargo does not need node_modules after
+          # Vite emitted apps/bootstrap-installer/dist.
+          if (Test-Path 'upstream/node_modules') {
+            Remove-Item 'upstream/node_modules' -Recurse -Force
+          }
+          if (Test-Path 'offline-work') {
+            Remove-Item 'offline-work' -Recurse -Force
+          }
+          Get-PSDrive -Name D,C | Select-Object Name, Free, Used | Format-Table -AutoSize
+
+      - name: Build official Hermes Bootstrap executable
+        working-directory: upstream/apps/bootstrap-installer
+        shell: pwsh
+        env:
+          HERMES_BUILD_PIN_COMMIT: ${{ env.HERMES_COMMIT }}
+          HERMES_BUILD_PIN_BRANCH: main
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --version
+          cargo --version
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo build of official Hermes Bootstrap failed.' }
+
+          $releaseRoot = Resolve-Path 'src-tauri/target/release'
+          $candidate = Get-ChildItem "$releaseRoot/*.exe" -File | `
+            Where-Object { $_.Name -notmatch 'build-script' } | `
+            Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $candidate) {
+            Get-ChildItem $releaseRoot | Select-Object Name, Length
+            throw 'Could not locate official Bootstrap executable after cargo build.'
+          }
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/offline-bundle/bootstrap" | Out-Null
+          Copy-Item $candidate.FullName "$env:GITHUB_WORKSPACE/offline-bundle/bootstrap/Hermes-Setup.exe" -Force
+          Write-Host "Bootstrap executable: $($candidate.FullName) ($($candidate.Length) bytes)"
+
+      - name: Install NSIS compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue
+          if (-not $makensis) {
+            choco install nsis -y --no-progress
+          }
+          $paths = @(
+            'C:\Program Files (x86)\NSIS\makensis.exe',
+            'C:\Program Files\NSIS\makensis.exe'
+          )
+          $makensis = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) {
+            $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $makensis = $cmd.Source }
+          }
+          if (-not $makensis) { throw 'makensis.exe was not found after NSIS installation.' }
+          "MAKENSIS=$makensis" >> $env:GITHUB_ENV
+
+      - name: Build single-file offline installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outDir = "$env:GITHUB_WORKSPACE/release"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $output = "$outDir/Hermes-Full-${{ steps.upstream.outputs.safe_ref }}-Windows-x64.exe"
+          $bootstrap = "$env:GITHUB_WORKSPACE/offline-bundle/bootstrap/Hermes-Setup.exe"
+          $offlineScript = "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1"
+          $payload = "$env:GITHUB_WORKSPACE/offline-bundle/payload"
+
+          & $env:MAKENSIS `
+            "/DOUTFILE=$output" `
+            "/DBOOTSTRAP_EXE=$bootstrap" `
+            "/DOFFLINE_SCRIPT=$offlineScript" `
+            "/DPAYLOAD_DIR=$payload" `
+            "/DHERMES_VERSION=${{ steps.upstream.outputs.safe_ref }}" `
+            "$env:GITHUB_WORKSPACE/installer/hermes-offline-wrapper.nsi"
+          if ($LASTEXITCODE -ne 0) { throw "NSIS wrapper build failed with exit $LASTEXITCODE" }
+          if (-not (Test-Path $output -PathType Leaf)) { throw 'Final offline installer was not produced.' }
+
+          Copy-Item "$payload/manifest.json" "$outDir/build-info.json"
+          $hash = (Get-FileHash $output -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $output -Leaf)" | Set-Content "$outDir/SHA256SUMS.txt" -Encoding ascii
+          Get-ChildItem $outDir | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload full offline build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-full-offline-${{ steps.upstream.outputs.safe_ref }}-windows-x64
+          path: release/*
+          retention-days: 7
+          compression-level: 0
