@@ -123,6 +123,7 @@ jobs:
             -OutputScript $offlineScript `
             -HermesCommit "$env:HERMES_COMMIT"
           ./scripts/harden-offline-runtime.ps1 -InstallScript $offlineScript
+          ./scripts/harden-offline-camofox.ps1 -InstallScript $offlineScript
 
       - name: Validate payload archive hashes
         shell: pwsh
