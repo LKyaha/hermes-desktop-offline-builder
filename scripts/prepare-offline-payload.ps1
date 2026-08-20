@@ -46,21 +46,17 @@ New-Item -ItemType Directory -Force -Path (Join-Path $managed 'bin') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $managed 'tools\bin') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $managed 'tools\licenses') | Out-Null
 
-function Get-GitHubHeaders {
-    $h = @{ 'User-Agent' = 'hermes-desktop-offline-builder' }
-    if ($env:GITHUB_TOKEN) { $h['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
-    return $h
-}
+$publicHeaders = @{ 'User-Agent' = 'hermes-desktop-offline-builder' }
 
 function Download([string]$Uri, [string]$Destination) {
     Write-Host "Downloading $Uri"
-    Invoke-WebRequest -Headers (Get-GitHubHeaders) -Uri $Uri -OutFile $Destination -UseBasicParsing
+    Invoke-WebRequest -Headers $publicHeaders -Uri $Uri -OutFile $Destination -UseBasicParsing
 }
 
 # ---------------------------------------------------------------------------
 # uv (same upstream policy as install.ps1: current official uv release)
 # ---------------------------------------------------------------------------
-$uvRelease = Invoke-RestMethod -Headers (Get-GitHubHeaders) -Uri 'https://api.github.com/repos/astral-sh/uv/releases/latest'
+$uvRelease = Invoke-RestMethod -Headers $publicHeaders -Uri 'https://api.github.com/repos/astral-sh/uv/releases/latest'
 $uvAsset = $uvRelease.assets | Where-Object { $_.name -eq 'uv-x86_64-pc-windows-msvc.zip' } | Select-Object -First 1
 if (-not $uvAsset) { throw 'Could not find Windows x64 uv release asset.' }
 $uvZip = Join-Path $WorkRoot 'uv.zip'
@@ -92,7 +88,7 @@ Write-Host "Managed Python: $pythonProbe"
 # Portable Node.js, following upstream's latest-v<major>.x policy.
 # ---------------------------------------------------------------------------
 $nodeIndexUrl = "https://nodejs.org/dist/latest-v${nodeMajor}.x/"
-$nodeIndex = Invoke-WebRequest -Uri $nodeIndexUrl -UseBasicParsing
+$nodeIndex = Invoke-WebRequest -Headers $publicHeaders -Uri $nodeIndexUrl -UseBasicParsing
 $nodeMatch = [regex]::Matches($nodeIndex.Content, "node-v${nodeMajor}\.\d+\.\d+-win-x64\.zip") | Select-Object -First 1
 if (-not $nodeMatch) { throw "Could not resolve latest Node v${nodeMajor}.x Windows x64 archive." }
 $nodeZipName = $nodeMatch.Value
@@ -106,6 +102,7 @@ Copy-Item $nodeDir.FullName (Join-Path $managed 'node') -Recurse -Force
 Remove-Item $nodeZip -Force
 Remove-Item $nodeExtract -Recurse -Force
 & (Join-Path $managed 'node\node.exe') --version
+if ($LASTEXITCODE -ne 0) { throw 'Bundled Node.js failed to execute.' }
 
 # ---------------------------------------------------------------------------
 # PortableGit, using the exact version pinned by upstream install.ps1.
@@ -123,12 +120,13 @@ $gitExe = Join-Path $gitDir 'cmd\git.exe'
 $bashExe = Join-Path $gitDir 'bin\bash.exe'
 if (-not (Test-Path $gitExe) -or -not (Test-Path $bashExe)) { throw 'PortableGit payload is incomplete.' }
 & $gitExe --version
+if ($LASTEXITCODE -ne 0) { throw 'Bundled PortableGit failed to execute.' }
 
 # ---------------------------------------------------------------------------
 # ripgrep + FFmpeg. Both archives include their redistribution notices; retain
 # those under tools\licenses in the payload.
 # ---------------------------------------------------------------------------
-$rgRelease = Invoke-RestMethod -Headers (Get-GitHubHeaders) -Uri 'https://api.github.com/repos/BurntSushi/ripgrep/releases/latest'
+$rgRelease = Invoke-RestMethod -Headers $publicHeaders -Uri 'https://api.github.com/repos/BurntSushi/ripgrep/releases/latest'
 $rgAsset = $rgRelease.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
 if (-not $rgAsset) { throw 'Could not find ripgrep Windows x64 release asset.' }
 $rgZip = Join-Path $WorkRoot 'ripgrep.zip'
@@ -235,8 +233,8 @@ try {
 }
 
 # ---------------------------------------------------------------------------
-# Collapse millions of cache files into six payload archives. The target uses
-# Windows' built-in bsdtar, so no extra decompressor is required.
+# Collapse cache trees into six payload archives. The target uses Windows'
+# built-in bsdtar, so no extra decompressor is required.
 # ---------------------------------------------------------------------------
 $tar = (Get-Command tar.exe -ErrorAction Stop).Source
 function New-TarGz([string]$SourceDir, [string]$Destination) {
@@ -253,8 +251,6 @@ New-TarGz $playwrightRoot (Join-Path $PayloadRoot 'ms-playwright.tar.gz')
 New-TarGz $sourceStage (Join-Path $PayloadRoot 'hermes-source.tar.gz')
 New-TarGz (Split-Path $desktopDir -Parent) (Join-Path $PayloadRoot 'desktop-win-x64.tar.gz')
 
-# desktop archive above contains release/win-unpacked's sibling layout if we
-# archive the release dir; make sure the expected root is present by listing it.
 $desktopListing = & $tar -tzf (Join-Path $PayloadRoot 'desktop-win-x64.tar.gz')
 if (-not ($desktopListing -match 'win-unpacked[/\\]Hermes\.exe')) {
     throw 'Desktop archive does not contain win-unpacked/Hermes.exe.'
