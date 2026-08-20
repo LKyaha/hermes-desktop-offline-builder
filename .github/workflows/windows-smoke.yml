@@ -1,0 +1,122 @@
+name: Windows x64 upstream build smoke
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: "Optional upstream tag / branch / commit"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream Hermes ref
+        id: upstream
+        shell: pwsh
+        env:
+          REQUESTED_REF: ${{ github.event.inputs.hermes_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ref = $env:REQUESTED_REF
+          if ([string]::IsNullOrWhiteSpace($ref)) {
+            try {
+              $headers = @{ 'User-Agent' = 'hermes-desktop-offline-builder' }
+              $release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/NousResearch/hermes-agent/releases/latest'
+              $ref = $release.tag_name
+            } catch {
+              Write-Warning "Could not resolve latest release; falling back to main: $($_.Exception.Message)"
+              $ref = 'main'
+            }
+          }
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+          Write-Host "Using upstream ref: $ref"
+
+      - name: Clone Hermes upstream
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git upstream
+          Set-Location upstream
+          git fetch --tags --force
+          git checkout '${{ steps.upstream.outputs.ref }}'
+          $sha = git rev-parse HEAD
+          "HERMES_COMMIT=$sha" >> $env:GITHUB_ENV
+          Write-Host "Hermes commit: $sha"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.0'
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          node --version
+          npm --version
+          git --version
+
+      - name: Install upstream workspace dependencies
+        working-directory: upstream
+        shell: pwsh
+        env:
+          npm_config_engine_strict: 'false'
+        run: npm ci
+
+      - name: Build official Hermes Desktop NSIS
+        working-directory: upstream/apps/desktop
+        shell: pwsh
+        env:
+          npm_config_engine_strict: 'false'
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run dist:win:nsis
+
+      - name: Collect smoke artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $exe = Get-ChildItem 'upstream/apps/desktop/release/*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { throw 'No Windows desktop EXE was produced.' }
+          Copy-Item $exe.FullName 'out/'
+          $info = [ordered]@{
+            upstream = 'NousResearch/hermes-agent'
+            ref = '${{ steps.upstream.outputs.ref }}'
+            commit = $env:HERMES_COMMIT
+            platform = 'windows'
+            arch = 'x64'
+            purpose = 'upstream desktop build smoke test; not the final offline installer'
+          }
+          $info | ConvertTo-Json | Set-Content -Encoding UTF8 'out/build-info.json'
+          Get-ChildItem out/* | ForEach-Object {
+            if (-not $_.PSIsContainer) {
+              $hash = Get-FileHash $_.FullName -Algorithm SHA256
+              "$($hash.Hash)  $($_.Name)" | Add-Content 'out/SHA256SUMS.txt'
+            }
+          }
+
+      - name: Upload smoke artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-windows-x64-upstream-smoke-${{ steps.upstream.outputs.ref }}
+          path: out/*
+          retention-days: 7
