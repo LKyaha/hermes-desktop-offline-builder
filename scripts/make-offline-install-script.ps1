@@ -57,6 +57,24 @@ function Invoke-HermesOfflineTarExtract {
     }
 }
 
+function Set-HermesOfflineUserPath {
+    param([string[]]$Entries)
+
+    $entries = @($Entries | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    if ($entries.Count -eq 0) { return }
+
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $old = if ($userPath) { @($userPath -split ';' | Where-Object { $_ }) } else { @() }
+    $seen = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $ordered = New-Object System.Collections.Generic.List[string]
+
+    foreach ($entry in (@($entries) + @($old))) {
+        if ($entry -and $seen.Add($entry)) { $ordered.Add($entry) }
+    }
+
+    [Environment]::SetEnvironmentVariable('Path', ([string]::Join(';', $ordered)), 'User')
+}
+
 function Initialize-HermesOfflineEnvironment {
     if (-not $script:HermesOfflineMode) { return }
 
@@ -93,10 +111,11 @@ function Initialize-HermesOfflineEnvironment {
         hermes_ref = $manifest.hermes_ref
         prepared_at = $manifest.prepared_at
     } | ConvertTo-Json
-    [System.IO.File]::WriteAllText($runtimeMarker, $runtimeRecord, (New-Object System.Text.UTF8Encoding $false))
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($runtimeMarker, $runtimeRecord, $utf8NoBom)
 
     # Make every upstream stage see the managed offline toolchain first.
-    $pathFront = @(
+    $processPathFront = @(
         (Join-Path $HermesHome 'bin'),
         (Join-Path $HermesHome 'node'),
         (Join-Path $HermesHome 'git\cmd'),
@@ -104,8 +123,26 @@ function Initialize-HermesOfflineEnvironment {
         (Join-Path $HermesHome 'git\usr\bin'),
         (Join-Path $HermesHome 'tools\bin')
     ) | Where-Object { Test-Path -LiteralPath $_ }
-    if ($pathFront.Count -gt 0) {
-        $env:Path = (($pathFront -join ';') + ';' + $env:Path)
+    if ($processPathFront.Count -gt 0) {
+        $env:Path = (($processPathFront -join ';') + ';' + $env:Path)
+    }
+
+    # Persist runtime-facing executables. uv/Python remain private managed
+    # runtimes; Node, Git Bash, ripgrep and ffmpeg are expected by Hermes tools
+    # launched in later processes.
+    $persistentPath = @(
+        (Join-Path $HermesHome 'node'),
+        (Join-Path $HermesHome 'git\cmd'),
+        (Join-Path $HermesHome 'git\bin'),
+        (Join-Path $HermesHome 'git\usr\bin'),
+        (Join-Path $HermesHome 'tools\bin')
+    )
+    Set-HermesOfflineUserPath -Entries $persistentPath
+
+    $managedBash = Join-Path $HermesHome 'git\bin\bash.exe'
+    if (Test-Path -LiteralPath $managedBash -PathType Leaf) {
+        $env:HERMES_GIT_BASH_PATH = $managedBash
+        [Environment]::SetEnvironmentVariable('HERMES_GIT_BASH_PATH', $managedBash, 'User')
     }
 
     # uv: managed Python + a build-time-warmed cache, with network hard-disabled.
@@ -190,7 +227,8 @@ function Install-Repository {
         hermes_commit = $manifest.hermes_commit
         hermes_ref = $manifest.hermes_ref
     } | ConvertTo-Json
-    [System.IO.File]::WriteAllText($versionMarker, $record, (New-Object System.Text.UTF8Encoding $false))
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($versionMarker, $record, $utf8NoBom)
     Write-Success "Bundled Hermes source installed ($($manifest.hermes_ref))"
 }
 
@@ -217,6 +255,18 @@ function Install-Desktop {
 
 if ($script:HermesOfflineMode -and -not $Manifest) {
     Initialize-HermesOfflineEnvironment
+}
+
+# Strict mode is used by the packaged installer and CI. If an upstream stage
+# unexpectedly reaches a PowerShell HTTP helper, fail immediately instead of
+# silently turning a supposedly offline install into a network install.
+if ($script:HermesOfflineMode -and $env:HERMES_OFFLINE_STRICT -eq '1') {
+    function Invoke-WebRequest {
+        throw 'Network access blocked by HERMES_OFFLINE_STRICT (Invoke-WebRequest).'
+    }
+    function Invoke-RestMethod {
+        throw 'Network access blocked by HERMES_OFFLINE_STRICT (Invoke-RestMethod).'
+    }
 }
 
 # End Hermes Desktop Offline Builder adapter
