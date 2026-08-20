@@ -41,14 +41,24 @@ function Invoke-HermesOfflineTarExtract {
         throw "Offline payload is incomplete: missing $archive"
     }
 
-    $tar = Get-Command tar.exe -ErrorAction SilentlyContinue
-    if (-not $tar) { $tar = Get-Command tar -ErrorAction SilentlyContinue }
-    if (-not $tar) { throw 'Windows tar.exe is required to unpack the Hermes offline payload.' }
+    # IMPORTANT: do not resolve tar from PATH first. Once the bundled
+    # PortableGit is activated, Git for Windows' GNU tar precedes the Windows
+    # bsdtar and interprets a native path like D:\bundle\file.tar.gz as
+    # host "D" + remote path, producing "Cannot connect to D". Windows'
+    # inbox bsdtar accepts drive-letter paths and is what the earlier payload
+    # extraction stages already use successfully.
+    $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (-not (Test-Path -LiteralPath $tarExe -PathType Leaf)) {
+        $tarCmd = Get-Command tar.exe -ErrorAction SilentlyContinue
+        if (-not $tarCmd) { $tarCmd = Get-Command tar -ErrorAction SilentlyContinue }
+        if (-not $tarCmd) { throw 'Windows tar.exe is required to unpack the Hermes offline payload.' }
+        $tarExe = $tarCmd.Source
+    }
 
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
     Write-Info "Expanding offline payload $ArchiveName ..."
-    & $tar.Source -xzf $archive -C $Destination
-    if ($LASTEXITCODE -ne 0) { throw "Failed to extract $ArchiveName (tar exit $LASTEXITCODE)" }
+    & $tarExe -xzf $archive -C $Destination
+    if ($LASTEXITCODE -ne 0) { throw "Failed to extract $ArchiveName (tar exit $LASTEXITCODE; executable $tarExe)" }
 }
 
 function Set-HermesOfflineUserPath {
@@ -298,6 +308,9 @@ $patched = "# Offline payload target commit: $HermesCommit`r`n" + $patched
 $outDir = Split-Path -Parent $OutputScript
 if ($outDir) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 
+# Windows PowerShell 5.1 interprets BOM-less script files using the active ANSI
+# code page. Match upstream bootstrap-cache behavior and emit UTF-8 with BOM.
 $utf8Bom = New-Object System.Text.UTF8Encoding $true
 [System.IO.File]::WriteAllText($OutputScript, $patched, $utf8Bom)
+
 Write-Host "Generated offline install script: $OutputScript"
