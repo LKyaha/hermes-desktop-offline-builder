@@ -69,6 +69,6 @@ Section "Hermes Offline Setup"
   System::Call 'Kernel32::SetEnvironmentVariable(t "HERMES_OFFLINE_PAYLOAD", t "$PLUGINSDIR\payload").i'
   System::Call 'Kernel32::SetEnvironmentVariable(t "HERMES_OFFLINE_STRICT", t "1").i'
 
-  ExecWait '\"$PLUGINSDIR\bootstrap\Hermes-Setup.exe\"' $0
+  ExecWait '"$PLUGINSDIR\bootstrap\Hermes-Setup.exe"' $0
   SetErrorLevel $0
 SectionEnd
