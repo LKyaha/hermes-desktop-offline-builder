@@ -116,7 +116,21 @@ Download $gitUrl $gitSfx
 New-Item -ItemType Directory -Force -Path $gitDir | Out-Null
 $gitExtract = Start-Process -FilePath $gitSfx -ArgumentList "-o`"$gitDir`"", '-y' -NoNewWindow -Wait -PassThru
 if ($gitExtract.ExitCode -ne 0) { throw "PortableGit extraction failed: $($gitExtract.ExitCode)" }
-Remove-Item $gitSfx -Force
+# The self-extractor can briefly keep its own executable open after the parent
+# process reports completion on hosted Windows runners. Cleanup is best-effort:
+# the extracted Git tree is the payload; this downloaded SFX is only temporary.
+for ($attempt = 1; $attempt -le 20; $attempt++) {
+    try {
+        Remove-Item $gitSfx -Force -ErrorAction Stop
+        break
+    } catch {
+        if ($attempt -eq 20) {
+            Write-Warning "PortableGit SFX is still locked after extraction; leaving temporary file in place: $gitSfx"
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
 $gitExe = Join-Path $gitDir 'cmd\git.exe'
 $bashExe = Join-Path $gitDir 'bin\bash.exe'
 if (-not (Test-Path $gitExe) -or -not (Test-Path $bashExe)) { throw 'PortableGit payload is incomplete.' }
