@@ -148,15 +148,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          existing="$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null || true)"
-          if [[ -n "$existing" ]]; then
-            if [[ "$(jq -r '.draft' <<<"$existing")" == 'false' ]]; then
+          # List releases instead of using the by-tag endpoint so drafts are
+          # visible and a normal 404 can never be mistaken for release JSON.
+          existing_line="$(
+            gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+              --jq '.[] | select(.tag_name == env.RELEASE_TAG) | [.id, .draft] | @tsv' \
+              | head -n 1
+          )"
+          if [[ -n "$existing_line" ]]; then
+            IFS=$'\t' read -r release_id release_draft <<< "$existing_line"
+            if [[ -z "$release_id" || "$release_id" == 'null' ]]; then
+              echo "Matched $RELEASE_TAG but could not resolve its release id." >&2
+              exit 1
+            fi
+            if [[ "$release_draft" == 'false' ]]; then
               echo "Validated immutable release already exists: $RELEASE_TAG"
               exit 0
             fi
 
             echo "Removing stale draft for $RELEASE_TAG before retry."
-            release_id="$(jq -r '.id' <<<"$existing")"
             gh api --method DELETE "repos/$GH_REPO/releases/$release_id"
             gh api --method DELETE "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" >/dev/null 2>&1 || true
           fi
