@@ -49,20 +49,60 @@ function Invoke-HermesOfflineNpmInstall {
         }
     }
 
-    Write-Info "Installing $Label from bundled npm cache (offline)..."
-    Push-Location $Directory
+    $resolvedDirectory = (Resolve-Path -LiteralPath $Directory).Path
+    $resolvedInstallDir = (Resolve-Path -LiteralPath $InstallDir).Path
+    $localLock = Join-Path $resolvedDirectory 'package-lock.json'
+    $rootLock = Join-Path $resolvedInstallDir 'package-lock.json'
+
+    # Hermes is an npm workspace. The root package-lock covers ui-tui and the
+    # other workspaces, so after the root npm ci succeeds there is no reason to
+    # run a second lock-mutating npm install from ui-tui/. In particular, npm
+    # install from a workspace can rewrite the root package-lock on Windows and
+    # make the otherwise pristine managed Git checkout look locally modified to
+    # the official `hermes update` path.
+    if ($resolvedDirectory -ne $resolvedInstallDir -and
+        -not (Test-Path -LiteralPath $localLock -PathType Leaf) -and
+        (Test-Path -LiteralPath $rootLock -PathType Leaf)) {
+        Write-Info "Skipping direct $Label npm install; dependencies are covered by the root workspace package-lock.json"
+        Write-Success "$Label dependencies satisfied by root workspace lock"
+        return
+    }
+
+    $hasLock = Test-Path -LiteralPath $localLock -PathType Leaf
+    $lockHashBefore = $null
+    if ($hasLock) {
+        $lockHashBefore = (Get-FileHash -LiteralPath $localLock -Algorithm SHA256).Hash
+        Write-Info "Installing $Label from bundled npm cache with npm ci (offline, lockfile immutable)..."
+    } else {
+        Write-Warn "$Label has no package-lock.json; falling back to npm install with package-lock writes disabled."
+        Write-Info "Installing $Label from bundled npm cache (offline)..."
+    }
+
+    Push-Location $resolvedDirectory
     $previousEap = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $npmExe install --offline --prefer-offline --no-audit --no-fund 2>&1 | ForEach-Object { "$_" | Write-Host }
+        if ($hasLock) {
+            & $npmExe ci --offline --prefer-offline --no-audit --no-fund 2>&1 | ForEach-Object { "$_" | Write-Host }
+        } else {
+            & $npmExe install --offline --prefer-offline --no-audit --no-fund --package-lock=false 2>&1 | ForEach-Object { "$_" | Write-Host }
+        }
         $npmExit = $LASTEXITCODE
         $ErrorActionPreference = $previousEap
         if ($npmExit -ne 0) {
-            throw "$Label npm install failed in strict offline mode (exit $npmExit). The payload npm cache is incomplete."
+            $verb = if ($hasLock) { 'npm ci' } else { 'npm install' }
+            throw "$Label $verb failed in strict offline mode (exit $npmExit). The payload npm cache is incomplete."
         }
     } finally {
         $ErrorActionPreference = $previousEap
         Pop-Location
+    }
+
+    if ($hasLock) {
+        $lockHashAfter = (Get-FileHash -LiteralPath $localLock -Algorithm SHA256).Hash
+        if ($lockHashAfter -ne $lockHashBefore) {
+            throw "$Label npm ci unexpectedly modified package-lock.json; refusing to hand a dirty checkout to the official updater."
+        }
     }
     Write-Success "$Label dependencies installed from bundled cache"
 }
