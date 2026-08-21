@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/upstream-watch.yml'
+      - '.github/workflows/publish-validated-release.yml'
 
 permissions:
   contents: read
@@ -22,7 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Resolve latest upstream release and dispatch only when missing
+      - name: Checkout current builder revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve desired immutable release and dispatch only when missing
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -31,22 +37,49 @@ jobs:
           set -euo pipefail
 
           upstream_ref="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)"
-          if [[ -z "$upstream_ref" || "$upstream_ref" == "null" ]]; then
+          if [[ -z "$upstream_ref" || "$upstream_ref" == 'null' ]]; then
             echo 'Could not resolve the latest NousResearch/hermes-agent release.' >&2
             exit 1
           fi
 
-          safe_ref="$(printf '%s' "$upstream_ref" | sed 's#[\\/:*?"<>|]#-#g')"
-          release_tag="offline-${safe_ref}"
-          echo "Latest upstream release: $upstream_ref"
-          echo "Expected builder release: $release_tag"
+          upstream_sha="$(gh api "repos/NousResearch/hermes-agent/commits/$upstream_ref" --jq .sha)"
+          if [[ -z "$upstream_sha" || ${#upstream_sha} -lt 12 ]]; then
+            echo "Could not resolve commit for upstream release $upstream_ref." >&2
+            exit 1
+          fi
 
-          if gh release view "$release_tag" >/dev/null 2>&1; then
-            echo 'A validated offline release already exists. No Windows runner needed.'
+          builder_sha="$(git rev-parse HEAD)"
+          builder_id="$({
+            git ls-tree -r HEAD -- .github/workflows scripts installer
+          } | sha256sum | cut -c1-12)"
+          if [[ -z "$builder_id" ]]; then
+            echo 'Could not compute builder content fingerprint.' >&2
+            exit 1
+          fi
+
+          safe_ref="$(printf '%s' "$upstream_ref" | sed 's#[\\/:*?"<>|]#-#g')"
+          release_tag="offline-${safe_ref}-u${upstream_sha:0:12}-b${builder_id}"
+
+          echo "Latest upstream release: $upstream_ref"
+          echo "Upstream commit: $upstream_sha"
+          echo "Builder commit: $builder_sha"
+          echo "Builder content fingerprint: $builder_id"
+          echo "Expected immutable release: $release_tag"
+
+          existing="$(gh api "repos/$GH_REPO/releases/tags/$release_tag" 2>/dev/null || true)"
+          if [[ -n "$existing" && "$(jq -r '.draft' <<<"$existing")" == 'false' ]]; then
+            echo 'The exact validated upstream+builder release already exists. No Windows runner needed.'
             exit 0
           fi
 
-          echo 'No published offline release exists; dispatching the full Windows validation/build.'
+          active_runs="$(gh run list --workflow offline-build.yml --branch main --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length')"
+          if [[ "$active_runs" != '0' ]]; then
+            echo "A full Windows build is already active ($active_runs run(s)); not dispatching a duplicate."
+            exit 0
+          fi
+
+          echo 'Exact validated release is missing; dispatching full Windows validation/build.'
           gh workflow run offline-build.yml \
+            --ref main \
             -f hermes_ref="$upstream_ref" \
-            -f publish=true
+            -f publish=false
