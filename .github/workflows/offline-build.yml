@@ -13,6 +13,11 @@ on:
         description: 'Optional upstream tag / branch / commit'
         required: false
         type: string
+      publish:
+        description: 'Publish a GitHub Release after every validation passes'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -113,6 +118,14 @@ jobs:
             -HermesRef '${{ steps.upstream.outputs.ref }}' `
             -HermesCommit "$env:HERMES_COMMIT"
 
+      - name: Replace FFmpeg with LGPL shared distribution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/replace-ffmpeg-with-lgpl.ps1 `
+            -PayloadRoot "$env:GITHUB_WORKSPACE/offline-bundle/payload" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/offline-work-ffmpeg"
+
       - name: Generate and harden offline install.ps1 adapter
         shell: pwsh
         run: |
@@ -194,6 +207,7 @@ jobs:
         run: |
           if (Test-Path 'upstream/node_modules') { Remove-Item 'upstream/node_modules' -Recurse -Force }
           if (Test-Path 'offline-work') { Remove-Item 'offline-work' -Recurse -Force }
+          if (Test-Path 'offline-work-ffmpeg') { Remove-Item 'offline-work-ffmpeg' -Recurse -Force }
           Get-PSDrive -Name D,C | Select-Object Name, Free, Used | Format-Table -AutoSize
 
       - name: Build official Hermes Bootstrap executable
@@ -257,6 +271,9 @@ jobs:
           if (-not (Test-Path $output -PathType Leaf)) { throw 'Final offline installer was not produced.' }
 
           Copy-Item "$payload/manifest.json" "$outDir/build-info.json"
+          if (Test-Path "$payload/THIRD_PARTY_NOTICES.txt") {
+            Copy-Item "$payload/THIRD_PARTY_NOTICES.txt" "$outDir/THIRD_PARTY_NOTICES.txt"
+          }
           $hash = (Get-FileHash $output -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $(Split-Path $output -Leaf)" | Set-Content "$outDir/SHA256SUMS.txt" -Encoding ascii
           Get-ChildItem $outDir | Select-Object Name, Length | Format-Table -AutoSize
@@ -268,3 +285,46 @@ jobs:
           path: release/*
           retention-days: 7
           compression-level: 0
+
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated build artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Publish immutable offline release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HERMES_REF: ${{ inputs.hermes_ref }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HERMES_REF}" ]]; then
+            echo 'Publishing requires an explicit hermes_ref so a release can never silently move.' >&2
+            exit 1
+          fi
+          safe_ref="$(printf '%s' "$HERMES_REF" | sed 's#[\\/:*?"<>|]#-#g')"
+          release_tag="offline-${safe_ref}"
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            echo "Release $release_tag already exists; refusing to replace an immutable tested release."
+            exit 0
+          fi
+
+          exe="$(find release -maxdepth 1 -type f -name 'Hermes-Full-*-Windows-x64.exe' -print -quit)"
+          if [[ -z "$exe" ]]; then
+            echo 'Validated artifact does not contain the expected offline EXE.' >&2
+            exit 1
+          fi
+
+          gh release create "$release_tag" release/* \
+            --title "Hermes Desktop Offline ${HERMES_REF} (Windows x64)" \
+            --notes "Automated Windows x64 full-offline build of NousResearch/hermes-agent ${HERMES_REF}. The installer was published only after the complete stage-protocol installation passed with installer networking blocked and strict offline guards enabled. Includes SHA256SUMS.txt, build-info.json, and third-party distribution notices. Unsigned build: Windows SmartScreen may warn."
