@@ -16,7 +16,7 @@ CRCCheck on
   !error "OFFLINE_SCRIPT define is required"
 !endif
 !ifndef TRANSACTION_SCRIPT
-  !error "TRANSACTION_SCRIPT define is required"
+  !define TRANSACTION_SCRIPT "${__FILEDIR__}\..\scripts\offline-transaction.ps1"
 !endif
 !ifndef PAYLOAD_DIR
   !error "PAYLOAD_DIR define is required"
