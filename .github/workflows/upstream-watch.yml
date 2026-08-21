@@ -1,0 +1,52 @@
+name: Hermes upstream release watch
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/upstream-watch.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: hermes-upstream-release-watch
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve latest upstream release and dispatch only when missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          upstream_ref="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)"
+          if [[ -z "$upstream_ref" || "$upstream_ref" == "null" ]]; then
+            echo 'Could not resolve the latest NousResearch/hermes-agent release.' >&2
+            exit 1
+          fi
+
+          safe_ref="$(printf '%s' "$upstream_ref" | sed 's#[\\/:*?"<>|]#-#g')"
+          release_tag="offline-${safe_ref}"
+          echo "Latest upstream release: $upstream_ref"
+          echo "Expected builder release: $release_tag"
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            echo 'A validated offline release already exists. No Windows runner needed.'
+            exit 0
+          fi
+
+          echo 'No published offline release exists; dispatching the full Windows validation/build.'
+          gh workflow run offline-build.yml \
+            -f hermes_ref="$upstream_ref" \
+            -f publish=true
