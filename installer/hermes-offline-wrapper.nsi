@@ -99,7 +99,7 @@ bootstrap_succeeded:
   IntCmp $1 0 transaction_success transaction_commit_failed transaction_commit_failed
 
 transaction_commit_failed:
-  MessageBox MB_OK|MB_ICONEXCLAMATION "Hermes installed successfully, but offline-upgrade cleanup did not finish cleanly.$\r$\n$\r$\nRe-running this installer will recover or finish the transaction safely."
+  MessageBox MB_OK|MB_ICONEXCLAMATION "Hermes offline upgrade could not be finalized safely.$\r$\n$\r$\nIf health validation failed, the transaction attempted to restore the previous managed installation. If only cleanup was interrupted, re-running this installer will finish it safely.$\r$\n$\r$\nDo not manually delete .hermes-offline-rollback if it exists."
   SetErrorLevel $1
   Goto transaction_done
 
