@@ -220,10 +220,10 @@ try {
 if (-not (Test-Path -LiteralPath $userState -PathType Leaf) -or (Get-Sha256 $userState) -ne $userStateHash) {
     throw 'Offline-to-offline upgrade did not preserve the HERMES_HOME user-state canary byte-for-byte.'
 }
-if (Get-Sha256 $desktop -ne $expectedDesktopHash) {
+if ((Get-Sha256 $desktop) -ne $expectedDesktopHash) {
     throw 'Offline-to-offline upgrade did not replace the old Desktop with the packaged Desktop bytes.'
 }
-if (Get-Sha256 $nodeExe -ne $expectedNodeHash) {
+if ((Get-Sha256 $nodeExe) -ne $expectedNodeHash) {
     throw 'Offline-to-offline upgrade did not refresh the managed Node runtime from the packaged runtime.'
 }
 if (Test-Path -LiteralPath (Join-Path $installRoot 'ci-local-source-edit.txt')) {
