@@ -152,8 +152,13 @@ jobs:
             -UpstreamInstallScript "$env:GITHUB_WORKSPACE/upstream/scripts/install.ps1" `
             -OutputScript $offlineScript `
             -HermesCommit "$env:HERMES_COMMIT"
+          ./scripts/harden-offline-transaction.ps1 -InstallScript $offlineScript
           ./scripts/harden-offline-runtime.ps1 -InstallScript $offlineScript
           ./scripts/harden-offline-camofox.ps1 -InstallScript $offlineScript
+          $finalText = [System.IO.File]::ReadAllText($offlineScript)
+          if ($finalText -match 'offline-backup-\$\(') {
+            throw 'Generated offline installer still contains a permanent backup constructor.'
+          }
 
       - name: Verify official-vs-offline resolved path compatibility
         shell: pwsh
