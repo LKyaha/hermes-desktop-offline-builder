@@ -96,7 +96,11 @@ if (Test-Path -LiteralPath $newArchive) { Remove-Item -LiteralPath $newArchive -
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $newArchive -PathType Leaf)) {
     throw 'Failed to rebuild desktop-win-x64.tar.gz after Desktop hardening.'
 }
-Move-Item -LiteralPath $newArchive -Destination $archive -Force
+# Move-Item -Force is not a reliable overwrite primitive for an existing file
+# on Windows PowerShell 5.1. Delete the old archive only after the replacement
+# has been fully written and validated as a real file.
+Remove-Item -LiteralPath $archive -Force
+Move-Item -LiteralPath $newArchive -Destination $archive
 
 $listing = & $tar -tzf $archive
 if ($LASTEXITCODE -ne 0 -or -not ($listing -match 'win-unpacked[/\\]Hermes\.exe')) {
