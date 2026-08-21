@@ -22,6 +22,30 @@ if (-not (Test-Path -LiteralPath (Join-Path $installRoot '.git') -PathType Conta
     throw 'Offline install did not leave a real Git checkout for the official updater.'
 }
 
+# First prove that a machine which already has an older offline-managed install
+# can consume the *new* offline payload in place. The helper turns the freshly
+# installed current tree into a synthetic prior-version install, runs every
+# current installer stage with networking hard-blocked, and validates user
+# state preservation + source backup + runtime/Desktop replacement. Using the
+# same test machine then immediately proves the second lifecycle hand-off below:
+# current offline install -> official online Desktop updater.
+$builderRoot = Split-Path -Parent $PSScriptRoot
+$offlineUpgradeTest = Join-Path $PSScriptRoot 'test-offline-to-offline-upgrade.ps1'
+$offlineInstallScript = Join-Path $builderRoot 'offline-bundle\offline-root\scripts\install.ps1'
+$payloadRoot = Join-Path $builderRoot 'offline-bundle\payload'
+foreach ($required in @($offlineUpgradeTest, $offlineInstallScript, (Join-Path $payloadRoot 'manifest.json'))) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+        throw "Lifecycle compatibility gate is missing offline-upgrade input: $required"
+    }
+}
+Write-Host '===== OFFLINE PACKAGE IN-PLACE UPGRADE GATE ====='
+& $offlineUpgradeTest `
+    -TestHome $TestHome `
+    -OfflineInstallScript $offlineInstallScript `
+    -PayloadRoot $payloadRoot `
+    -InstalledCommit $InstalledCommit
+Write-Host 'Offline package in-place upgrade gate passed.'
+
 # The offline restrictions are deliberately installation-process-only. A real
 # user closes the Bootstrap installer and later launches Hermes in a fresh
 # process. Reproduce that boundary explicitly before invoking the repo-owned
@@ -161,6 +185,14 @@ try {
     $sentinelAfter = [System.IO.File]::ReadAllText($sentinel)
     if ($sentinelAfter -ne $sentinelValue) {
         throw 'Official update modified the HERMES_HOME preservation sentinel.'
+    }
+
+    # The canary written by the immediately preceding offline->offline upgrade
+    # must survive the subsequent official updater too, proving continuity
+    # across both supported upgrade routes in one lifecycle test.
+    $offlineUpgradeState = Join-Path $TestHome 'ci-offline-upgrade-user-state\state.json'
+    if (-not (Test-Path -LiteralPath $offlineUpgradeState -PathType Leaf)) {
+        throw 'Official updater removed state preserved by the offline-to-offline upgrade gate.'
     }
 
     $originAfter = (& $gitExe remote get-url origin).Trim()
