@@ -138,6 +138,14 @@ jobs:
           ./scripts/harden-offline-runtime.ps1 -InstallScript $offlineScript
           ./scripts/harden-offline-camofox.ps1 -InstallScript $offlineScript
 
+      - name: Verify official-vs-offline resolved path compatibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/test-path-compatibility.ps1 `
+            -UpstreamInstallScript "$env:GITHUB_WORKSPACE/upstream/scripts/install.ps1" `
+            -OfflineInstallScript "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1"
+
       - name: Validate payload archive hashes
         shell: pwsh
         run: |
@@ -193,7 +201,14 @@ jobs:
           & $python -c 'import dotenv, openai, rich, prompt_toolkit, fastapi, uvicorn'
           if ($LASTEXITCODE -ne 0) { throw 'Post-install Python import validation failed.' }
           Write-Host 'Offline stage-protocol test passed.'
-          Remove-Item $testHome -Recurse -Force
+
+      - name: Verify restored-online official Desktop updater takeover
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/test-official-update-takeover.ps1 `
+            -TestHome "$env:GITHUB_WORKSPACE/offline-test-home" `
+            -InstalledCommit "$env:HERMES_COMMIT"
 
       - name: Build official Hermes Bootstrap frontend
         working-directory: upstream/apps/bootstrap-installer
@@ -206,6 +221,7 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path 'upstream/node_modules') { Remove-Item 'upstream/node_modules' -Recurse -Force }
+          if (Test-Path 'offline-test-home') { Remove-Item 'offline-test-home' -Recurse -Force }
           if (Test-Path 'offline-work') { Remove-Item 'offline-work' -Recurse -Force }
           if (Test-Path 'offline-work-ffmpeg') { Remove-Item 'offline-work-ffmpeg' -Recurse -Force }
           Get-PSDrive -Name D,C | Select-Object Name, Free, Used | Format-Table -AutoSize
@@ -327,4 +343,4 @@ jobs:
 
           gh release create "$release_tag" release/* \
             --title "Hermes Desktop Offline ${HERMES_REF} (Windows x64)" \
-            --notes "Automated Windows x64 full-offline build of NousResearch/hermes-agent ${HERMES_REF}. The installer was published only after the complete stage-protocol installation passed with installer networking blocked and strict offline guards enabled. Includes SHA256SUMS.txt, build-info.json, and third-party distribution notices. Unsigned build: Windows SmartScreen may warn."
+            --notes "Automated Windows x64 full-offline build of NousResearch/hermes-agent ${HERMES_REF}. Published only after the complete stage-protocol install passed with installer networking blocked, the generated installer matched upstream resolved-path semantics, and the installed copy successfully handed control back to the official Windows Desktop updater after networking was restored. Includes SHA256SUMS.txt, build-info.json, and third-party distribution notices. Unsigned build: Windows SmartScreen may warn."
