@@ -35,6 +35,23 @@ jobs:
       - name: Checkout builder repository
         uses: actions/checkout@v4
 
+      - name: Validate builder PowerShell syntax
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = $false
+          Get-ChildItem "$env:GITHUB_WORKSPACE/scripts" -Filter '*.ps1' -File | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "PowerShell parse errors in $($_.Name):"
+              $errors | ForEach-Object { Write-Host "  $($_.Message) at $($_.Extent.StartLineNumber):$($_.Extent.StartColumnNumber)" }
+            }
+          }
+          if ($failed) { throw 'Builder PowerShell syntax validation failed.' }
+
       - name: Resolve upstream Hermes ref
         id: upstream
         shell: pwsh
@@ -202,7 +219,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Post-install Python import validation failed.' }
           Write-Host 'Offline stage-protocol test passed.'
 
-      - name: Verify restored-online official Desktop updater takeover
+      - name: Verify transactional upgrade and restored-online official updater takeover
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -222,6 +239,7 @@ jobs:
         run: |
           if (Test-Path 'upstream/node_modules') { Remove-Item 'upstream/node_modules' -Recurse -Force }
           if (Test-Path 'offline-test-home') { Remove-Item 'offline-test-home' -Recurse -Force }
+          if (Test-Path 'offline-transaction-failure-fixture') { Remove-Item 'offline-transaction-failure-fixture' -Recurse -Force }
           if (Test-Path 'offline-work') { Remove-Item 'offline-work' -Recurse -Force }
           if (Test-Path 'offline-work-ffmpeg') { Remove-Item 'offline-work-ffmpeg' -Recurse -Force }
           Get-PSDrive -Name D,C | Select-Object Name, Free, Used | Format-Table -AutoSize
@@ -274,12 +292,14 @@ jobs:
           $output = "$outDir/Hermes-Full-${{ steps.upstream.outputs.safe_ref }}-Windows-x64.exe"
           $bootstrap = "$env:GITHUB_WORKSPACE/offline-bundle/bootstrap/Hermes-Setup.exe"
           $offlineScript = "$env:GITHUB_WORKSPACE/offline-bundle/offline-root/scripts/install.ps1"
+          $transactionScript = "$env:GITHUB_WORKSPACE/scripts/offline-transaction.ps1"
           $payload = "$env:GITHUB_WORKSPACE/offline-bundle/payload"
 
           & $env:MAKENSIS `
             "/DOUTFILE=$output" `
             "/DBOOTSTRAP_EXE=$bootstrap" `
             "/DOFFLINE_SCRIPT=$offlineScript" `
+            "/DTRANSACTION_SCRIPT=$transactionScript" `
             "/DPAYLOAD_DIR=$payload" `
             "/DHERMES_VERSION=${{ steps.upstream.outputs.safe_ref }}" `
             "$env:GITHUB_WORKSPACE/installer/hermes-offline-wrapper.nsi"
@@ -343,4 +363,4 @@ jobs:
 
           gh release create "$release_tag" release/* \
             --title "Hermes Desktop Offline ${HERMES_REF} (Windows x64)" \
-            --notes "Automated Windows x64 full-offline build of NousResearch/hermes-agent ${HERMES_REF}. Published only after the complete stage-protocol install passed with installer networking blocked, the generated installer matched upstream resolved-path semantics, and the installed copy successfully handed control back to the official Windows Desktop updater after networking was restored. Includes SHA256SUMS.txt, build-info.json, and third-party distribution notices. Unsigned build: Windows SmartScreen may warn."
+            --notes "Automated Windows x64 full-offline build of NousResearch/hermes-agent ${HERMES_REF}. Published only after the complete stage-protocol install passed with installer networking blocked, resolved paths matched upstream, offline-to-offline upgrade succeeded transactionally with no permanent rollback storage, an intentional failure restored the old managed bytes, and the installed copy successfully handed control back to the official Windows Desktop updater after networking was restored. Includes SHA256SUMS.txt, build-info.json, and third-party distribution notices. Unsigned build: Windows SmartScreen may warn."
