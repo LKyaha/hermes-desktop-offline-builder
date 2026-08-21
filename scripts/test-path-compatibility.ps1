@@ -71,7 +71,7 @@ function Assert-SameReport {
         $a = Normalize-PathValue $Official.$field
         $b = Normalize-PathValue $Offline.$field
         if (-not [string]::Equals($a, $b, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "Path compatibility regression in '$Scenario' for $field: official='$a' offline='$b'"
+            throw "Path compatibility regression in '$Scenario' for ${field}: official='$a' offline='$b'"
         }
     }
 
@@ -82,7 +82,7 @@ function Assert-SameReport {
         $a = $Official.$field | ConvertTo-Json -Compress -Depth 8
         $b = $Offline.$field | ConvertTo-Json -Compress -Depth 8
         if ($a -ne $b) {
-            throw "Path compatibility regression in '$Scenario' for $field: official=$a offline=$b"
+            throw "Path compatibility regression in '$Scenario' for ${field}: official=$a offline=$b"
         }
     }
 
