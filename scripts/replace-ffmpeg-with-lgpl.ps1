@@ -93,6 +93,7 @@ is not legal advice; downstream redistributors remain responsible for their
 own license compliance.
 "@
 Set-Content -LiteralPath (Join-Path $licenseDir 'FFMPEG_DISTRIBUTION.txt') -Value $notice -Encoding utf8
+Set-Content -LiteralPath (Join-Path $PayloadRoot 'THIRD_PARTY_NOTICES.txt') -Value $notice -Encoding utf8
 
 $ffmpeg = Join-Path $managedBin 'ffmpeg.exe'
 $ffprobe = Join-Path $managedBin 'ffprobe.exe'
