@@ -21,8 +21,8 @@ if (-not (Test-Path -LiteralPath $BootstrapExe -PathType Leaf)) {
 # WebView2 deliberately ignores WEBVIEW2_* browser-flag overrides and HKCU
 # AdditionalBrowserArguments policy for an elevated host. HKLM policy remains
 # supported, so install an app-scoped temporary policy value for Hermes-Setup.exe
-# and restore it exactly in finally. Keep the environment variable too as a
-# fallback for non-elevated local runs where HKLM may not be writable.
+# and restore it exactly in finally. The environment-variable mechanism is used
+# only as a fallback for non-elevated local runs where HKLM is not writable.
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
 $listener.Start()
 $cdpPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
@@ -56,7 +56,7 @@ $proc = $null
 try {
     $env:HERMES_HOME = $smokeRoot
     Remove-Item Env:\HERMES_SETUP_DEV_REPO_ROOT -ErrorAction SilentlyContinue
-    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$cdpPort"
+    Remove-Item Env:\WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS -ErrorAction SilentlyContinue
     $env:WEBVIEW2_USER_DATA_FOLDER = $webViewUserData
 
     # Elevated WebView2 hosts ignore user-scoped browser flag overrides. Use the
@@ -86,16 +86,18 @@ try {
         )
         $policyInjected = $true
     } catch {
-        # This is expected on a non-elevated developer machine. In that case the
-        # environment variable above is honored by WebView2 and remains a valid
-        # fallback. CI is expected to be able to install the HKLM policy.
+        # Expected on a non-elevated developer machine. Only in this fallback
+        # case use the process environment override; do not mix override scopes.
+        $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$cdpPort"
         Write-Warning "Could not install HKLM WebView2 CDP policy; relying on process environment fallback: $($_.Exception.Message)"
     }
 
     Write-Host "Launching packaged Bootstrap smoke: $BootstrapExe"
     Write-Host "WebView2 CDP probe port: $cdpPort"
     Write-Host "WebView2 user data: $webViewUserData"
-    Write-Host "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
+    $browserArgsEnv = [Environment]::GetEnvironmentVariable('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'Process')
+    if ([string]::IsNullOrWhiteSpace($browserArgsEnv)) { $browserArgsEnv = '<unset>' }
+    Write-Host "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=$browserArgsEnv"
     Write-Host "WebView2 HKLM CDP policy injected: $policyInjected"
     if ($policyInjected) {
         Write-Host "WebView2 HKLM policy value: $policyKey :: $policyValueName"
