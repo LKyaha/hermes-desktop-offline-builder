@@ -49,6 +49,38 @@ New-Item -ItemType Directory -Force -Path (Join-Path $managed 'tools\licenses') 
 
 $publicHeaders = @{ 'User-Agent' = 'hermes-desktop-offline-builder' }
 
+# GitHub-hosted Windows runners share public egress IPs, so anonymous REST API
+# lookups can randomly hit the 60 requests/hour/IP limit. Authenticate API-only
+# requests whenever possible. Never reuse this header for release/CDN or other
+# third-party downloads, because redirects must not be allowed to carry secrets.
+$githubApiHeaders = @{
+    'User-Agent' = 'hermes-desktop-offline-builder'
+    'Accept' = 'application/vnd.github+json'
+    'X-GitHub-Api-Version' = '2022-11-28'
+}
+$githubToken = @($env:GH_TOKEN_LOCAL, $env:GITHUB_TOKEN, $env:GH_TOKEN) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    Select-Object -First 1
+if ($githubToken) {
+    $githubApiHeaders['Authorization'] = "Bearer $githubToken"
+} else {
+    # actions/checkout@v4 persists an Authorization extraheader in the checked
+    # out repository. Reuse it only for api.github.com when no explicit token
+    # environment variable was supplied.
+    try {
+        $gitRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+        $extraHeader = (& git -C $gitRoot config --get 'http.https://github.com/.extraheader' 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $extraHeader -match '^AUTHORIZATION:\s*(.+)$') {
+            $githubApiHeaders['Authorization'] = $Matches[1].Trim()
+        }
+    } catch {
+        # Local/manual builds may not have checkout-managed credentials.
+    }
+}
+if (-not $githubApiHeaders.ContainsKey('Authorization')) {
+    Write-Warning 'No GitHub API credential is available; GitHub release metadata lookups will use the anonymous rate limit.'
+}
+
 function Download([string]$Uri, [string]$Destination) {
     Write-Host "Downloading $Uri"
     Invoke-WebRequest -Headers $publicHeaders -Uri $Uri -OutFile $Destination -UseBasicParsing
@@ -57,7 +89,7 @@ function Download([string]$Uri, [string]$Destination) {
 # ---------------------------------------------------------------------------
 # uv (same upstream policy as install.ps1: current official uv release)
 # ---------------------------------------------------------------------------
-$uvRelease = Invoke-RestMethod -Headers $publicHeaders -Uri 'https://api.github.com/repos/astral-sh/uv/releases/latest'
+$uvRelease = Invoke-RestMethod -Headers $githubApiHeaders -Uri 'https://api.github.com/repos/astral-sh/uv/releases/latest'
 $uvAsset = $uvRelease.assets | Where-Object { $_.name -eq 'uv-x86_64-pc-windows-msvc.zip' } | Select-Object -First 1
 if (-not $uvAsset) { throw 'Could not find Windows x64 uv release asset.' }
 $uvZip = Join-Path $WorkRoot 'uv.zip'
@@ -140,7 +172,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Bundled PortableGit failed to execute.' }
 # ---------------------------------------------------------------------------
 # ripgrep + FFmpeg. These are placed on Hermes' managed tools PATH.
 # ---------------------------------------------------------------------------
-$rgRelease = Invoke-RestMethod -Headers $publicHeaders -Uri 'https://api.github.com/repos/BurntSushi/ripgrep/releases/latest'
+$rgRelease = Invoke-RestMethod -Headers $githubApiHeaders -Uri 'https://api.github.com/repos/BurntSushi/ripgrep/releases/latest'
 $rgAsset = $rgRelease.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
 if (-not $rgAsset) { throw 'Could not find ripgrep Windows x64 release asset.' }
 $rgZip = Join-Path $WorkRoot 'ripgrep.zip'
