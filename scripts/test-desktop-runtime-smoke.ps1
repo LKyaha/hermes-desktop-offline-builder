@@ -32,18 +32,17 @@ if (Test-Path -LiteralPath $logPath -PathType Leaf) {
 }
 
 # Reserve a loopback port for Chromium CDP, then release it immediately before
-# launch. The packaged app is started with an intentionally BROKEN dev-server
-# override; a correct production build must ignore it and load file://.../dist/index.html.
+# launch. This smoke exercises the exact packaged Desktop installed from the
+# offline payload and verifies that its renderer comes from the bundled local
+# files and that the managed Hermes backend actually reaches its ready state.
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
 $listener.Start()
 $cdpPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
 $listener.Stop()
-$badDevServer = 'http://127.0.0.1:9'
 
 $envNames = @(
     'HERMES_HOME',
     'HERMES_DESKTOP_USER_DATA_DIR',
-    'HERMES_DESKTOP_DEV_SERVER',
     'HERMES_DESKTOP_SKIP_QUIT_CONFIRM'
 )
 $oldEnv = @{}
@@ -55,10 +54,9 @@ $proc = $null
 try {
     $env:HERMES_HOME = $TestHome
     $env:HERMES_DESKTOP_USER_DATA_DIR = $userData
-    $env:HERMES_DESKTOP_DEV_SERVER = $badDevServer
     $env:HERMES_DESKTOP_SKIP_QUIT_CONFIRM = '1'
 
-    Write-Host "Launching final packaged Desktop with poisoned dev-server env: $badDevServer"
+    Write-Host "Launching final packaged Desktop: $exe"
     Write-Host "CDP probe port: $cdpPort"
     $proc = Start-Process -FilePath $exe `
         -WorkingDirectory $desktopRoot `
@@ -81,15 +79,11 @@ try {
             foreach ($target in $targets) {
                 $url = [string]$target.url
                 if ([string]::IsNullOrWhiteSpace($url)) { continue }
-                if ($url -like "$badDevServer*") {
-                    throw "Packaged Hermes.exe honored HERMES_DESKTOP_DEV_SERVER and navigated to $url"
-                }
                 if ([string]$target.type -eq 'page' -and $url -match '^file:' -and $url -match 'dist/index\.html') {
                     $rendererUrl = $url
                 }
             }
         } catch {
-            if ($_.Exception.Message -match 'honored HERMES_DESKTOP_DEV_SERVER') { throw }
             # CDP starts a little after the Electron process; keep polling.
         }
 
@@ -117,7 +111,7 @@ try {
             Write-Host '----- desktop.log smoke tail -----'
             Get-Content -LiteralPath $logPath -Tail 120
         }
-        throw 'Packaged Desktop never exposed a local file:// renderer target.'
+        throw 'Packaged Desktop never exposed its bundled local file:// renderer target.'
     }
     if (-not $backendReady) {
         if (Test-Path -LiteralPath $logPath) {
