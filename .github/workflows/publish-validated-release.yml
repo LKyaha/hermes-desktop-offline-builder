@@ -55,6 +55,8 @@ jobs:
       - name: Validate artifact and resolve immutable release identity
         id: release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test -f release/build-info.json
@@ -74,6 +76,14 @@ jobs:
             exit 1
           fi
 
+          latest_ref="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)"
+          publishable='false'
+          if [[ "$upstream_ref" == "$latest_ref" ]]; then
+            publishable='true'
+          else
+            echo "Validated ref $upstream_ref is not current upstream stable $latest_ref; keeping it as an Actions artifact only."
+          fi
+
           safe_ref="$(printf '%s' "$upstream_ref" | sed 's#[\\/:*?"<>|]#-#g')"
           upstream_short="${upstream_sha:0:12}"
           builder_id='${{ steps.builder.outputs.id }}'
@@ -83,9 +93,11 @@ jobs:
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "exe_name=$(basename "$exe")" >> "$GITHUB_OUTPUT"
+          echo "publishable=$publishable" >> "$GITHUB_OUTPUT"
           echo "Immutable release tag: $release_tag"
 
       - name: Write release provenance metadata
+        if: ${{ steps.release.outputs.publishable == 'true' }}
         shell: bash
         env:
           UPSTREAM_REF: ${{ steps.release.outputs.upstream_ref }}
@@ -122,6 +134,7 @@ jobs:
             }' > release/release-provenance.json
 
       - name: Publish complete immutable release atomically
+        if: ${{ steps.release.outputs.publishable == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
