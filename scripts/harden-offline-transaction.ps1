@@ -20,9 +20,8 @@ $payloadRoot = Join-Path $builderRoot 'offline-bundle\payload'
 $manifestPath = Join-Path $payloadRoot 'manifest.json'
 $upstreamRoot = Join-Path $builderRoot 'upstream'
 $sourceHardener = Join-Path $PSScriptRoot 'harden-windows-source-checkout.ps1'
-$desktopHardener = Join-Path $PSScriptRoot 'harden-offline-desktop.ps1'
 
-foreach ($required in @($manifestPath, $upstreamRoot, $sourceHardener, $desktopHardener)) {
+foreach ($required in @($manifestPath, $upstreamRoot, $sourceHardener)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Transactional hardening requires the completed builder workspace; missing: $required"
     }
@@ -38,15 +37,6 @@ if ([string]::IsNullOrWhiteSpace([string]$payloadManifest.hermes_commit)) {
     -PayloadRoot $payloadRoot
 if ($LASTEXITCODE -ne 0) {
     throw "Windows-safe source payload hardening failed with exit $LASTEXITCODE"
-}
-
-# Production Desktop hardening is deliberately applied to the generated bundle,
-# not tracked upstream source. This closes a Windows failure mode where a stale
-# HERMES_DESKTOP_DEV_SERVER environment variable makes a packaged Hermes.exe
-# open a dead 127.0.0.1 development server instead of its bundled renderer.
-& $desktopHardener -PayloadRoot $payloadRoot -UpstreamRoot $upstreamRoot
-if ($LASTEXITCODE -ne 0) {
-    throw "Packaged Desktop hardening failed with exit $LASTEXITCODE"
 }
 
 $text = [System.IO.File]::ReadAllText($InstallScript)
@@ -80,7 +70,7 @@ $new = @'
 
         # If Bootstrap retries the repository stage after a partial extraction,
         # the real old installation is already safe in .hermes-offline-rollback.
-        # Discard only this incomplete NEW checkout and retry from bundled bytes.
+        # Discard only this incomplete NEW checkout and retry extraction.
         Write-Warn 'Discarding a partial new checkout inside the active offline upgrade transaction...'
         Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
     }
