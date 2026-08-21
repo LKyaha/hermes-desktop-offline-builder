@@ -8,6 +8,37 @@ if (-not (Test-Path -LiteralPath $InstallScript -PathType Leaf)) {
     throw "Generated install script not found: $InstallScript"
 }
 
+# This hardener is an existing mandatory step in the full-offline builder, so
+# use it as the gate that finalizes the source archive for Windows BEFORE the
+# generated target installer is exercised. The initial payload preparer still
+# creates a conventional clone; this pass deliberately rebuilds hermes-source
+# from Git objects with sparse checkout + core.autocrlf configured before the
+# first worktree materialization.
+$builderRoot = Split-Path $PSScriptRoot -Parent
+$workRoot = Join-Path $builderRoot 'offline-work'
+$payloadRoot = Join-Path $builderRoot 'offline-bundle\payload'
+$manifestPath = Join-Path $payloadRoot 'manifest.json'
+$upstreamRoot = Join-Path $builderRoot 'upstream'
+$sourceHardener = Join-Path $PSScriptRoot 'harden-windows-source-checkout.ps1'
+
+foreach ($required in @($manifestPath, $upstreamRoot, $sourceHardener)) {
+    if (-not (Test-Path -LiteralPath $required)) {
+        throw "Transactional hardening requires the completed builder workspace; missing: $required"
+    }
+}
+$payloadManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+if ([string]::IsNullOrWhiteSpace([string]$payloadManifest.hermes_commit)) {
+    throw 'Offline payload manifest does not contain hermes_commit.'
+}
+& $sourceHardener `
+    -UpstreamRoot $upstreamRoot `
+    -HermesCommit ([string]$payloadManifest.hermes_commit) `
+    -WorkRoot $workRoot `
+    -PayloadRoot $payloadRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "Windows-safe source payload hardening failed with exit $LASTEXITCODE"
+}
+
 $text = [System.IO.File]::ReadAllText($InstallScript)
 $old = @'
     if (Test-Path -LiteralPath $InstallDir) {
