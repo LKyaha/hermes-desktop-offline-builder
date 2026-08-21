@@ -31,11 +31,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $installRoot '.git') -PathType Conta
 # current offline install -> official online Desktop updater.
 $builderRoot = Split-Path -Parent $PSScriptRoot
 $offlineUpgradeTest = Join-Path $PSScriptRoot 'test-offline-to-offline-upgrade.ps1'
+$desktopSmokeTest = Join-Path $PSScriptRoot 'test-desktop-runtime-smoke.ps1'
 $offlineInstallScript = Join-Path $builderRoot 'offline-bundle\offline-root\scripts\install.ps1'
 $payloadRoot = Join-Path $builderRoot 'offline-bundle\payload'
-foreach ($required in @($offlineUpgradeTest, $offlineInstallScript, (Join-Path $payloadRoot 'manifest.json'))) {
+foreach ($required in @($offlineUpgradeTest, $desktopSmokeTest, $offlineInstallScript, (Join-Path $payloadRoot 'manifest.json'))) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
-        throw "Lifecycle compatibility gate is missing offline-upgrade input: $required"
+        throw "Lifecycle compatibility gate is missing required input: $required"
     }
 }
 Write-Host '===== OFFLINE PACKAGE IN-PLACE UPGRADE GATE ====='
@@ -97,6 +98,15 @@ foreach ($name in @('HERMES_OFFLINE_PAYLOAD', 'HERMES_OFFLINE_STRICT', 'UV_OFFLI
         throw "Offline-only environment variable leaked into the User environment: $name=$persisted"
     }
 }
+
+# A file-existence check is not enough for Electron. Launch the exact Desktop
+# installed from the offline payload, poison HERMES_DESKTOP_DEV_SERVER with a
+# dead loopback URL, and require the packaged app to load its local file://
+# renderer plus start the local Hermes backend. This specifically catches the
+# observed failure mode "Hermes frame opens but 127.0.0.1 refuses to connect".
+Write-Host '===== PACKAGED DESKTOP RUNTIME SMOKE ====='
+& $desktopSmokeTest -TestHome $TestHome
+Write-Host 'Packaged Desktop runtime smoke passed.'
 
 Push-Location $installRoot
 try {
