@@ -37,21 +37,30 @@ foreach ($required in @($OfflineInstallScript, $transactionScript, (Join-Path $P
 }
 if (-not (Test-Path -LiteralPath (Join-Path $installRoot '.git') -PathType Container)) { throw 'Installed checkout has no .git directory.' }
 
-# Record the known-good current payload bytes, then synthesize a prior release.
+# Record the known-good current payload bytes, then synthesize a distinct old
+# managed checkout entirely from the currently materialized release tree. The
+# shipped source repository may intentionally be a partial clone, so HEAD^ can
+# exist while some historical blobs are absent. This fixture is testing the
+# transaction boundary, not Git history traversal; keep it fully offline and
+# independent of historical object availability.
 $expectedDesktopHash = Get-Sha256 $desktop
 $expectedNodeHash = Get-Sha256 $nodeExe
 Push-Location $installRoot
 try {
     if ((& $gitExe rev-parse HEAD).Trim() -ne $InstalledCommit) { throw 'Fresh install HEAD does not match packaged commit.' }
-    $oldCommit = (& $gitExe rev-parse "$InstalledCommit^" 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $oldCommit) {
-        & $gitExe fetch --depth 2 origin $InstalledCommit
-        if ($LASTEXITCODE -ne 0) { throw 'Could not fetch enough history for the old-version fixture.' }
-        $oldCommit = (& $gitExe rev-parse "$InstalledCommit^" | Out-String).Trim()
+    $currentTree = (& $gitExe rev-parse "$InstalledCommit^{tree}" | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $currentTree) { throw 'Could not resolve packaged commit tree for the old-version fixture.' }
+
+    $oldCommit = ('CI synthetic prior managed checkout' | & $gitExe -c user.name='Hermes Offline CI' -c user.email='offline-ci@example.invalid' commit-tree $currentTree | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $oldCommit -or $oldCommit -eq $InstalledCommit) {
+        throw 'Could not create a distinct synthetic old-version fixture commit.'
     }
-    if (-not $oldCommit -or $oldCommit -eq $InstalledCommit) { throw 'Could not resolve a distinct prior commit.' }
+    & $gitExe cat-file -e "$oldCommit^{commit}"
+    if ($LASTEXITCODE -ne 0) { throw "Synthetic old-version fixture commit is unreadable: $oldCommit" }
     & $gitExe checkout -f --detach $oldCommit
     if ($LASTEXITCODE -ne 0) { throw "Could not synthesize prior checkout $oldCommit." }
+    if ((& $gitExe rev-parse HEAD).Trim() -ne $oldCommit) { throw 'Synthetic old-version fixture checkout did not land on its generated commit.' }
+    Write-Host "Synthetic offline-upgrade fixture commit: $oldCommit"
 } finally { Pop-Location }
 
 $userStateDir = Join-Path $TestHome 'ci-offline-upgrade-user-state'
