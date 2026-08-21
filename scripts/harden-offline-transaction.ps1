@@ -20,8 +20,9 @@ $payloadRoot = Join-Path $builderRoot 'offline-bundle\payload'
 $manifestPath = Join-Path $payloadRoot 'manifest.json'
 $upstreamRoot = Join-Path $builderRoot 'upstream'
 $sourceHardener = Join-Path $PSScriptRoot 'harden-windows-source-checkout.ps1'
+$desktopHardener = Join-Path $PSScriptRoot 'harden-offline-desktop.ps1'
 
-foreach ($required in @($manifestPath, $upstreamRoot, $sourceHardener)) {
+foreach ($required in @($manifestPath, $upstreamRoot, $sourceHardener, $desktopHardener)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Transactional hardening requires the completed builder workspace; missing: $required"
     }
@@ -37,6 +38,15 @@ if ([string]::IsNullOrWhiteSpace([string]$payloadManifest.hermes_commit)) {
     -PayloadRoot $payloadRoot
 if ($LASTEXITCODE -ne 0) {
     throw "Windows-safe source payload hardening failed with exit $LASTEXITCODE"
+}
+
+# Production Desktop hardening is deliberately applied to the generated bundle,
+# not tracked upstream source. This closes a Windows failure mode where a stale
+# HERMES_DESKTOP_DEV_SERVER environment variable makes a packaged Hermes.exe
+# open a dead 127.0.0.1 development server instead of its bundled renderer.
+& $desktopHardener -PayloadRoot $payloadRoot -UpstreamRoot $upstreamRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "Packaged Desktop hardening failed with exit $LASTEXITCODE"
 }
 
 $text = [System.IO.File]::ReadAllText($InstallScript)
