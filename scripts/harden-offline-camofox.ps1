@@ -108,7 +108,9 @@ foreach ($entry in @($manifest.archives)) {
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 
 # ---------------------------------------------------------------------------
-# Patch the target-side installer: verify, do not npm-install, Camofox.
+# Patch the target-side installer: verify, do not npm-install, Camofox; and
+# normalize the managed Git worktree so the official online updater can take
+# over cleanly on Windows.
 # ---------------------------------------------------------------------------
 $text = [System.IO.File]::ReadAllText($InstallScript)
 $marker = '# Stage definitions -- the single source of truth.'
@@ -119,11 +121,69 @@ if ($index -lt 0) {
 
 $block = @'
 # ============================================================================
-# Full-offline Camofox hardening
+# Full-offline Camofox + official-updater handoff hardening
 # ============================================================================
 # Camofox is materialized into the bundled Node prefix at build time. Target
 # machines never invoke npm for it; strict offline mode verifies the exact tree
 # extracted from managed-runtime.tar.gz.
+
+$script:HermesOfflinePreHandoffInstallRepository = (Get-Item Function:\Install-Repository).ScriptBlock
+
+function Install-Repository {
+    & $script:HermesOfflinePreHandoffInstallRepository
+    if (-not $script:HermesOfflineMode) { return }
+
+    # Upstream release history contains contributor-email metadata paths that
+    # differ only by letter case. NTFS' normal case-insensitive worktree cannot
+    # materialize both names, so an otherwise pristine release checkout appears
+    # permanently dirty. The official updater then stashes that synthetic dirt
+    # and can fail while switching detached HEAD back to main. contributors/ is
+    # metadata only, not Hermes runtime code, so exclude that one tree using
+    # Git's native sparse-worktree mechanism while keeping the exact HEAD and
+    # official origin unchanged.
+    $gitDir = Join-Path $InstallDir '.git'
+    $gitInfo = Join-Path $gitDir 'info'
+    if (-not (Test-Path -LiteralPath $gitInfo -PathType Container)) {
+        throw 'Offline checkout is missing .git/info; cannot prepare official updater handoff.'
+    }
+
+    Push-Location $InstallDir
+    try {
+        git -c windows.appendAtomically=false config core.autocrlf false
+        if ($LASTEXITCODE -ne 0) { throw 'Could not configure core.autocrlf for the offline checkout.' }
+        git -c windows.appendAtomically=false config core.sparseCheckout true
+        if ($LASTEXITCODE -ne 0) { throw 'Could not enable sparse checkout for Windows collision avoidance.' }
+        git -c windows.appendAtomically=false config core.sparseCheckoutCone false
+        if ($LASTEXITCODE -ne 0) { throw 'Could not select non-cone sparse checkout mode.' }
+
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        $sparsePath = Join-Path $gitInfo 'sparse-checkout'
+        [System.IO.File]::WriteAllText($sparsePath, "/*`r`n!/contributors/`r`n", $utf8NoBom)
+        git -c windows.appendAtomically=false read-tree -mu HEAD
+        if ($LASTEXITCODE -ne 0) { throw 'Could not apply sparse checkout for Windows case-collision metadata.' }
+
+        # These are generated/managed install artifacts, not source edits. Keep
+        # them out of the official updater's autostash while still letting real
+        # user modifications remain visible to normal Git status/stash logic.
+        $excludePath = Join-Path $gitInfo 'exclude'
+        $excludeText = if (Test-Path -LiteralPath $excludePath) { [System.IO.File]::ReadAllText($excludePath) } else { '' }
+        foreach ($pattern in @('/.hermes-offline-source.json', '/bin/')) {
+            if ($excludeText -notmatch ('(?m)^' + [regex]::Escape($pattern) + '$')) {
+                if ($excludeText -and -not $excludeText.EndsWith("`n")) { $excludeText += "`r`n" }
+                $excludeText += "$pattern`r`n"
+            }
+        }
+        [System.IO.File]::WriteAllText($excludePath, $excludeText, $utf8NoBom)
+
+        $dirtyTracked = @(git -c windows.appendAtomically=false status --porcelain --untracked-files=no 2>$null | Where-Object { $_ -and $_.ToString().Trim() })
+        if ($dirtyTracked.Count -gt 0) {
+            throw "Offline managed checkout remains tracked-dirty after Windows collision hardening: $($dirtyTracked -join '; ')"
+        }
+    } finally {
+        Pop-Location
+    }
+    Write-Success 'Managed Git checkout prepared for official online updater handoff'
+}
 
 function Install-AgentBrowser {
     if (-not $script:HermesOfflineMode) {
@@ -192,7 +252,7 @@ function Install-NodeDeps {
     Install-CuaDriver
 }
 
-# End Full-offline Camofox hardening
+# End Full-offline Camofox + updater handoff hardening
 
 '@
 
@@ -212,4 +272,4 @@ if ($text -notmatch 'HermesPreHardenInstallAgentBrowser') {
 $patched = $text.Insert($index, $block)
 $utf8Bom = New-Object System.Text.UTF8Encoding $true
 [System.IO.File]::WriteAllText($InstallScript, $patched, $utf8Bom)
-Write-Host "Applied build-materialized offline Camofox override: $InstallScript"
+Write-Host "Applied build-materialized offline Camofox + official-updater handoff override: $InstallScript"
