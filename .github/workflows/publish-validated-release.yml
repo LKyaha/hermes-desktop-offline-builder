@@ -1,0 +1,177 @@
+name: Publish validated offline release
+
+on:
+  workflow_run:
+    workflows: ['Windows x64 full offline build']
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-validated-offline-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact validated builder revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+
+      - name: Compute builder content fingerprint
+        id: builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          builder_sha='${{ github.event.workflow_run.head_sha }}'
+          builder_id="$({
+            git ls-tree -r HEAD -- .github/workflows scripts installer
+          } | sha256sum | cut -c1-12)"
+          if [[ -z "$builder_id" ]]; then
+            echo 'Could not compute builder content fingerprint.' >&2
+            exit 1
+          fi
+          echo "sha=$builder_sha" >> "$GITHUB_OUTPUT"
+          echo "id=$builder_id" >> "$GITHUB_OUTPUT"
+          echo "Builder commit: $builder_sha"
+          echo "Builder content fingerprint: $builder_id"
+
+      - name: Download artifact from validated Windows run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: release
+          merge-multiple: true
+
+      - name: Validate artifact and resolve immutable release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f release/build-info.json
+          test -f release/SHA256SUMS.txt
+          exe="$(find release -maxdepth 1 -type f -name 'Hermes-Full-*-Windows-x64.exe' -print -quit)"
+          if [[ -z "$exe" ]]; then
+            echo 'Validated artifact does not contain the expected offline EXE.' >&2
+            exit 1
+          fi
+
+          (cd release && sha256sum -c SHA256SUMS.txt)
+
+          upstream_ref="$(jq -r '.hermes_ref // empty' release/build-info.json)"
+          upstream_sha="$(jq -r '.hermes_commit // empty' release/build-info.json)"
+          if [[ -z "$upstream_ref" || -z "$upstream_sha" || ${#upstream_sha} -lt 12 ]]; then
+            echo 'build-info.json is missing hermes_ref/hermes_commit.' >&2
+            exit 1
+          fi
+
+          safe_ref="$(printf '%s' "$upstream_ref" | sed 's#[\\/:*?"<>|]#-#g')"
+          upstream_short="${upstream_sha:0:12}"
+          builder_id='${{ steps.builder.outputs.id }}'
+          release_tag="offline-${safe_ref}-u${upstream_short}-b${builder_id}"
+
+          echo "upstream_ref=$upstream_ref" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "exe_name=$(basename "$exe")" >> "$GITHUB_OUTPUT"
+          echo "Immutable release tag: $release_tag"
+
+      - name: Write release provenance metadata
+        shell: bash
+        env:
+          UPSTREAM_REF: ${{ steps.release.outputs.upstream_ref }}
+          UPSTREAM_SHA: ${{ steps.release.outputs.upstream_sha }}
+          BUILDER_SHA: ${{ steps.builder.outputs.sha }}
+          BUILDER_ID: ${{ steps.builder.outputs.id }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg schema '1' \
+            --arg upstream_repository 'NousResearch/hermes-agent' \
+            --arg upstream_ref "$UPSTREAM_REF" \
+            --arg upstream_commit "$UPSTREAM_SHA" \
+            --arg builder_repository '${{ github.repository }}' \
+            --arg builder_commit "$BUILDER_SHA" \
+            --arg builder_content_fingerprint "$BUILDER_ID" \
+            --arg release_tag "$RELEASE_TAG" \
+            --arg workflow_run_id "$SOURCE_RUN_ID" \
+            --arg workflow_run_url "$SOURCE_RUN_URL" \
+            '{
+              schema: ($schema|tonumber),
+              upstream_repository: $upstream_repository,
+              upstream_ref: $upstream_ref,
+              upstream_commit: $upstream_commit,
+              builder_repository: $builder_repository,
+              builder_commit: $builder_commit,
+              builder_content_fingerprint: $builder_content_fingerprint,
+              release_tag: $release_tag,
+              validated_workflow_run_id: ($workflow_run_id|tonumber),
+              validated_workflow_run_url: $workflow_run_url
+            }' > release/release-provenance.json
+
+      - name: Publish complete immutable release atomically
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          UPSTREAM_REF: ${{ steps.release.outputs.upstream_ref }}
+          UPSTREAM_SHA: ${{ steps.release.outputs.upstream_sha }}
+          BUILDER_SHA: ${{ steps.builder.outputs.sha }}
+          BUILDER_ID: ${{ steps.builder.outputs.id }}
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          existing="$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null || true)"
+          if [[ -n "$existing" ]]; then
+            if [[ "$(jq -r '.draft' <<<"$existing")" == 'false' ]]; then
+              echo "Validated immutable release already exists: $RELEASE_TAG"
+              exit 0
+            fi
+
+            echo "Removing stale draft for $RELEASE_TAG before retry."
+            release_id="$(jq -r '.id' <<<"$existing")"
+            gh api --method DELETE "repos/$GH_REPO/releases/$release_id"
+            gh api --method DELETE "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" >/dev/null 2>&1 || true
+          fi
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<EOF
+          Automated Windows x64 full-offline build of NousResearch/hermes-agent ${UPSTREAM_REF}.
+
+          Immutable provenance:
+          - Upstream commit: ${UPSTREAM_SHA}
+          - Builder commit: ${BUILDER_SHA}
+          - Builder content fingerprint: ${BUILDER_ID}
+          - Validated workflow run: ${SOURCE_RUN_URL}
+
+          Published only after the complete stage-protocol install passed with installer networking blocked, resolved paths matched upstream, offline-to-offline upgrade succeeded transactionally with no permanent rollback storage, an intentional failure restored the old managed bytes, and the installed copy successfully handed control back to the official Windows Desktop updater after networking was restored.
+
+          Includes SHA256SUMS.txt, build-info.json, release-provenance.json, and third-party distribution notices when applicable. Unsigned build: Windows SmartScreen may warn.
+          EOF
+
+          # Draft first: users never see a partially uploaded release.
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --target "$BUILDER_SHA" \
+            --title "Hermes Desktop Offline ${UPSTREAM_REF} · b${BUILDER_ID} (Windows x64)" \
+            --notes-file "$notes_file"
+
+          gh release upload "$RELEASE_TAG" release/*
+
+          # Only after every asset upload succeeds does the release become visible.
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+          echo "Published validated immutable release: $RELEASE_TAG"
