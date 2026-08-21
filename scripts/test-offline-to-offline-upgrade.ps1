@@ -67,7 +67,13 @@ try {
         throw 'Could not resolve a distinct previous Hermes commit for offline-upgrade simulation.'
     }
 
-    & $gitExe checkout --detach $oldCommit
+    # Upstream currently contains paths that differ only by letter case. On a
+    # case-insensitive Windows filesystem that can make a freshly extracted,
+    # otherwise-valid checkout appear dirty before CI has touched it. Forcing
+    # this *fixture-only* transition is safe: we are deliberately synthesizing
+    # an older install here. Real user modifications are added below and must
+    # survive the actual offline upgrade inside its repository safety backup.
+    & $gitExe checkout -f --detach $oldCommit
     if ($LASTEXITCODE -ne 0) { throw "Could not park synthetic old install at $oldCommit." }
     $oldHead = (& $gitExe rev-parse HEAD).Trim()
     if ($oldHead -ne $oldCommit) { throw "Synthetic old checkout mismatch: expected $oldCommit, got $oldHead." }
@@ -154,7 +160,6 @@ try {
                 throw "Repository upgrade should create exactly one safety backup; found $($newOnes.Count)."
             }
             $newBackup = $newOnes[0].FullName
-            $backupGit = Join-Path $newBackup 'git\cmd\git.exe'
             if (-not (Test-Path -LiteralPath (Join-Path $newBackup '.git') -PathType Container)) {
                 throw "Safety backup lost Git metadata: $newBackup"
             }
