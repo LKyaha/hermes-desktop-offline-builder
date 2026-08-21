@@ -35,12 +35,49 @@ $headers = @{
     'User-Agent' = 'hermes-desktop-offline-builder'
     'Accept' = 'application/vnd.github+json'
 }
-$release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest'
-$asset = @($release.assets) | Where-Object { $_.name -match '^ffmpeg-.*-win64-lgpl-shared\.zip$' } | Select-Object -First 1
-if (-not $asset) { throw 'Latest BtbN/FFmpeg-Builds release has no Windows x64 LGPL shared ZIP asset.' }
 
-Write-Host "Downloading LGPL shared FFmpeg: $($asset.name)"
-Invoke-WebRequest -Headers $headers -Uri $asset.browser_download_url -OutFile $download -UseBasicParsing
+# GitHub-hosted runners share public egress IPs, so anonymous API calls can hit
+# the 60-request/hour limit even though this workflow itself made very few
+# requests. actions/checkout persists the workflow token as a local Git HTTP
+# extraheader; reuse that credential for the GitHub API without printing it or
+# forwarding it to the eventual release-asset host.
+try {
+    $extraHeader = (& git config --local --get http.https://github.com/.extraheader 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $extraHeader -match '^(?i)AUTHORIZATION:\s*(.+)$') {
+        $headers['Authorization'] = $Matches[1]
+    }
+} catch {
+    # Anonymous lookup remains usable when no checkout credential is present.
+}
+
+$release = $null
+$asset = $null
+$releaseTag = $null
+$assetName = $null
+$assetUrl = $null
+try {
+    $release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest'
+    $asset = @($release.assets) | Where-Object { $_.name -match '^ffmpeg-.*-win64-lgpl-shared\.zip$' } | Select-Object -First 1
+    if (-not $asset) { throw 'Latest BtbN/FFmpeg-Builds release has no Windows x64 LGPL shared ZIP asset.' }
+    $releaseTag = $release.tag_name
+    $assetName = $asset.name
+    $assetUrl = $asset.browser_download_url
+} catch {
+    # GitHub exposes a stable latest-release redirect for named assets. This
+    # fallback removes a flaky API dependency while retaining the important
+    # safety property below: the downloaded binary must actually report LGPL
+    # shared configuration and must not report --enable-gpl.
+    Write-Warning "BtbN release API lookup failed; using latest-release asset redirect: $($_.Exception.Message)"
+    $releaseTag = 'latest'
+    $assetName = 'ffmpeg-master-latest-win64-lgpl-shared.zip'
+    $assetUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/$assetName"
+}
+
+Write-Host "Downloading LGPL shared FFmpeg: $assetName"
+$downloadHeaders = @{
+    'User-Agent' = 'hermes-desktop-offline-builder'
+}
+Invoke-WebRequest -Headers $downloadHeaders -Uri $assetUrl -OutFile $download -UseBasicParsing
 Expand-Archive -Path $download -DestinationPath $extract -Force
 
 $binDir = Get-ChildItem -LiteralPath $extract -Recurse -Directory | Where-Object { $_.Name -eq 'bin' } | Select-Object -First 1
@@ -79,9 +116,9 @@ $notice = @"
 FFmpeg distribution used by Hermes Desktop Offline Builder
 ==========================================================
 Binary provider: BtbN/FFmpeg-Builds
-Release tag: $($release.tag_name)
-Binary asset: $($asset.name)
-Binary source page: https://github.com/BtbN/FFmpeg-Builds/releases/tag/$($release.tag_name)
+Release tag: $releaseTag
+Binary asset: $assetName
+Binary source page: https://github.com/BtbN/FFmpeg-Builds/releases/latest
 Build scripts/source repository: https://github.com/BtbN/FFmpeg-Builds
 FFmpeg upstream source: https://ffmpeg.org/download.html
 Selected variant: Windows x64, LGPL, shared libraries
@@ -117,8 +154,8 @@ $entry.bytes = $item.Length
 $entry.sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 $ffmpegMeta = [ordered]@{
     provider = 'BtbN/FFmpeg-Builds'
-    release_tag = $release.tag_name
-    asset = $asset.name
+    release_tag = $releaseTag
+    asset = $assetName
     license_variant = 'LGPL shared'
     binary_sha256 = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
 }
@@ -128,4 +165,4 @@ $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -En
 Remove-Item -LiteralPath $stage -Recurse -Force
 Remove-Item -LiteralPath $extract -Recurse -Force
 Remove-Item -LiteralPath $download -Force
-Write-Host "Replaced FFmpeg with BtbN LGPL shared asset: $($asset.name)"
+Write-Host "Replaced FFmpeg with BtbN LGPL shared asset: $assetName"
