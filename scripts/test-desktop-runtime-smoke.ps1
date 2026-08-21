@@ -26,9 +26,9 @@ if (Test-Path -LiteralPath $userData) {
 }
 New-Item -ItemType Directory -Force -Path $userData | Out-Null
 
-$beforeLogLength = 0L
+$beforeLogChars = 0
 if (Test-Path -LiteralPath $logPath -PathType Leaf) {
-    $beforeLogLength = (Get-Item -LiteralPath $logPath).Length
+    $beforeLogChars = [System.IO.File]::ReadAllText($logPath).Length
 }
 
 # Reserve a loopback port for Chromium CDP, then release it immediately before
@@ -95,7 +95,7 @@ try {
 
         if (Test-Path -LiteralPath $logPath -PathType Leaf) {
             $allLog = [System.IO.File]::ReadAllText($logPath)
-            $newLog = if ($allLog.Length -gt $beforeLogLength) { $allLog.Substring([int]$beforeLogLength) } else { '' }
+            $newLog = if ($allLog.Length -gt $beforeLogChars) { $allLog.Substring($beforeLogChars) } else { '' }
             if ($newLog -match 'Renderer failed to load') {
                 Write-Host '----- desktop.log smoke tail -----'
                 Get-Content -LiteralPath $logPath -Tail 120
