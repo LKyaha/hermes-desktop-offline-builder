@@ -98,16 +98,30 @@ function Restore-Transaction {
         return
     }
 
+    # A Begin failure can happen after only SOME old paths were renamed. Never
+    # delete a source path unless its old counterpart is visibly present in the
+    # rollback area. Once state reached active, Bootstrap may also have created
+    # managed paths that did not exist before Begin; those new-only paths must be
+    # removed during rollback.
+    $wasActive = ($Record.state -eq 'active' -or $Record.state -eq 'rolling_back')
     $Record.state = 'rolling_back'
     $Record.updated_at = (Get-Date).ToUniversalTime().ToString('o')
     Write-Transaction $Record
 
-    # Drop every managed artifact the failed new install may have created,
-    # including artifacts that did not exist before Begin.
-    foreach ($path in @($Record.managed_paths)) {
-        if ($path) {
-            if (-not (Remove-PathWithRetry -Path ([string]$path))) {
-                throw "Rollback could not remove the partial new managed artifact: $path"
+    $entryBySource = @{}
+    foreach ($entry in @($Record.entries)) {
+        $entryBySource[[string]$entry.source] = $entry
+    }
+
+    if ($wasActive) {
+        foreach ($path in @($Record.managed_paths)) {
+            if (-not $path) { continue }
+            $sourcePath = [string]$path
+            if ($entryBySource.ContainsKey($sourcePath)) { continue }
+            # This managed path did not exist before Begin, so anything there is
+            # a new-only artifact created by the failed installation.
+            if (-not (Remove-PathWithRetry -Path $sourcePath)) {
+                throw "Rollback could not remove a new-only managed artifact: $sourcePath"
             }
         }
     }
@@ -115,18 +129,32 @@ function Restore-Transaction {
     foreach ($entry in @($Record.entries)) {
         $source = [string]$entry.source
         $saved = [string]$entry.rollback
-        if (-not (Test-Path -LiteralPath $saved)) {
-            throw "Rollback payload is missing the previous managed artifact: $saved"
+        $savedExists = Test-Path -LiteralPath $saved
+        $sourceExists = Test-Path -LiteralPath $source
+
+        if ($savedExists) {
+            # The old artifact was successfully staged. Anything currently at
+            # its live path belongs to the failed new install and can be removed.
+            if ($sourceExists -and -not (Remove-PathWithRetry -Path $source)) {
+                throw "Rollback could not remove the partial replacement before restoring: $source"
+            }
+            $parent = Split-Path $source -Parent
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            Move-Item -LiteralPath $saved -Destination $source -Force -ErrorAction Stop
+            continue
         }
-        $parent = Split-Path $source -Parent
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-        Move-Item -LiteralPath $saved -Destination $source -Force -ErrorAction Stop
+
+        # No rollback copy means Begin never moved this old artifact. If the
+        # original source is still present, leave it untouched. Missing BOTH is
+        # genuine data loss/corruption and must remain recoverable rather than
+        # being silently reported as success.
+        if (-not $sourceExists) {
+            throw "Rollback cannot find either the live or staged previous artifact: $source"
+        }
     }
 
     Remove-Item -LiteralPath $rollbackRecord -Force -ErrorAction SilentlyContinue
-    if (Test-Path -LiteralPath $rollbackRoot) {
-        [void](Remove-PathWithRetry -Path $rollbackRoot)
-    }
+    if (Test-Path -LiteralPath $rollbackRoot) { [void](Remove-PathWithRetry -Path $rollbackRoot) }
     Remove-Item -LiteralPath $transactionPath -Force -ErrorAction SilentlyContinue
     Write-Host 'Hermes offline upgrade rollback restored the previous managed installation.'
 }
@@ -225,13 +253,11 @@ switch ($Mode) {
             Write-Host 'No Hermes offline upgrade transaction needs commit.'
             exit 0
         }
-        if ($record.state -eq 'rolling_back') {
-            throw 'Cannot commit a Hermes offline upgrade transaction that is rolling back.'
-        }
+        if ($record.state -eq 'rolling_back') { throw 'Cannot commit a transaction that is rolling back.' }
 
-        # Publish the success state before deleting old bytes. If power is lost
-        # during cleanup, the next installer run will finish cleanup rather than
-        # incorrectly reverting a successfully installed new version.
+        # Publish success BEFORE deleting old bytes. If power is lost during
+        # cleanup, the next installer run finishes cleanup and never reverts a
+        # successfully installed new version.
         $record.state = 'committed'
         $record.updated_at = (Get-Date).ToUniversalTime().ToString('o')
         Write-Transaction $record
@@ -240,14 +266,11 @@ switch ($Mode) {
         if ($clean) {
             Remove-Item -LiteralPath $transactionPath -Force -ErrorAction SilentlyContinue
         } else {
-            # The new installation is already committed and usable. Preserve the
-            # small marker so a later installer launch knows to clean, never roll
-            # back, the stale temporary directory.
             Write-Warning "Hermes upgrade succeeded but temporary rollback cleanup is pending: $rollbackRoot"
         }
 
-        # Remove permanent backups left by older versions of this builder. They
-        # are builder-owned managed-checkout snapshots, not Hermes user state.
+        # Older builder revisions permanently retained these source snapshots.
+        # They are builder-managed checkout copies, not Hermes user state.
         Get-ChildItem -LiteralPath $HermesHome -Directory -Filter 'hermes-agent.offline-backup-*' -ErrorAction SilentlyContinue | ForEach-Object {
             [void](Remove-PathWithRetry -Path $_.FullName)
         }
