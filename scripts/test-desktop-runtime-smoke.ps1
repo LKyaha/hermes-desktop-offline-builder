@@ -95,7 +95,13 @@ try {
                 Get-Content -LiteralPath $logPath -Tail 120
                 throw 'Packaged Desktop renderer failed to load during runtime smoke.'
             }
-            if ($newLog -match 'HERMES_DASHBOARD_READY') {
+
+            # Current Hermes Desktop launches the headless local backend with
+            # `hermes serve`, which announces HERMES_BACKEND_READY. Older
+            # dashboard-backed builds announced HERMES_DASHBOARD_READY. Accept
+            # either protocol marker so this gate tests readiness rather than a
+            # historical implementation detail.
+            if ($newLog -match 'HERMES_(?:BACKEND|DASHBOARD)_READY\s+port=\d+') {
                 $backendReady = $true
             }
         }
@@ -118,7 +124,7 @@ try {
             Write-Host '----- desktop.log smoke tail -----'
             Get-Content -LiteralPath $logPath -Tail 160
         }
-        throw 'Packaged Desktop renderer loaded, but the local Hermes backend never announced HERMES_DASHBOARD_READY.'
+        throw 'Packaged Desktop renderer loaded, but the local Hermes backend never announced a ready marker.'
     }
 
     Write-Host "Packaged Desktop renderer loaded from: $rendererUrl"
