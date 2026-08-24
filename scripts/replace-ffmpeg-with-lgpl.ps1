@@ -166,3 +166,16 @@ Remove-Item -LiteralPath $stage -Recurse -Force
 Remove-Item -LiteralPath $extract -Recurse -Force
 Remove-Item -LiteralPath $download -Force
 Write-Host "Replaced FFmpeg with BtbN LGPL shared asset: $assetName"
+
+# Finalize the source archive from the official remote rather than from the
+# workflow's partial clone. Keeping this here makes it part of the existing
+# payload-finalization step without adding another expensive CI phase.
+$builderRoot = Split-Path $PSScriptRoot -Parent
+$sourceHardener = Join-Path $PSScriptRoot 'harden-source-repository.ps1'
+$finalManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+& $sourceHardener `
+    -WorkRoot (Join-Path $builderRoot 'offline-work') `
+    -PayloadRoot $PayloadRoot `
+    -HermesRef ([string]$finalManifest.hermes_ref) `
+    -HermesCommit ([string]$finalManifest.hermes_commit)
+if ($LASTEXITCODE -ne 0) { throw 'Bundled source repository hardening failed.' }
