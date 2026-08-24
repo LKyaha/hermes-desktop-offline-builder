@@ -19,48 +19,65 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     throw "Offline payload manifest is missing: $manifestPath"
 }
 
-# The build checkout is intentionally allowed to be a Git partial clone for CI
-# speed. It must NEVER be used as the parent of the checkout shipped to users.
-# A local clone of a partial/promisor repository can look healthy while the
-# original CI object store is still present, then fail later on a clean machine
-# when `git fetch origin main` receives thin-pack deltas whose bases are absent.
-# Build the distributable checkout directly from the official remote instead.
+# The build checkout may be a partial clone for CI speed. The checkout shipped
+# to users must be independent of that build tree AND must not be shallow.
+# Hermes' official Windows updater performs ancestry/fetch/reset operations that
+# are not reliable across a shallow boundary. A depth-1 repository can pass
+# `git fsck`, run the packaged release perfectly, and still fail or mis-align on
+# the first in-app update. Therefore the distributable source repository is a
+# full-history, non-partial clone made directly from the official remote.
 if (Test-Path -LiteralPath $sourceStage) {
     Remove-Item -LiteralPath $sourceStage -Recurse -Force
 }
-New-Item -ItemType Directory -Force -Path $sourceStage | Out-Null
 
-Write-Host 'Rebuilding bundled Hermes source as a self-contained non-partial Git checkout...'
-& git -C $sourceStage init
-if ($LASTEXITCODE -ne 0) { throw 'git init failed for bundled source checkout.' }
-& git -C $sourceStage remote add origin $officialOrigin
-if ($LASTEXITCODE -ne 0) { throw 'Could not add official Hermes origin.' }
+Write-Host 'Rebuilding bundled Hermes source as a full-history, non-partial Git checkout...'
+& git clone --no-tags --no-checkout $officialOrigin $sourceStage
+if ($LASTEXITCODE -ne 0) { throw 'Could not clone full Hermes history from the official origin.' }
 
-# Fetch a depth-1 snapshot: all objects needed by the packaged release are
-# present, but we do not bloat the offline installer with the repository's full
-# history. Prefer the user/build ref (release tag in normal automation), then
-# fall back to the exact commit for manual SHA builds.
-$fetchCandidates = @($HermesRef, $HermesCommit) |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-    Select-Object -Unique
-$fetched = $false
-foreach ($candidate in $fetchCandidates) {
-    Write-Host "Fetching complete release snapshot from official origin: $candidate"
-    & git -C $sourceStage fetch --depth=1 --no-tags origin $candidate
-    if ($LASTEXITCODE -eq 0) {
-        & git -C $sourceStage cat-file -e "$HermesCommit^{commit}" 2>$null
+# A manually requested commit/ref can theoretically be outside the default
+# branch history. Fetch it without depth if the full clone did not already
+# obtain it. Never introduce a shallow boundary here.
+& git -C $sourceStage cat-file -e "$HermesCommit^{commit}" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    $fetchCandidates = @($HermesRef, $HermesCommit) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    $fetched = $false
+    foreach ($candidate in $fetchCandidates) {
+        Write-Host "Fetching requested full-history ref from official origin: $candidate"
+        & git -C $sourceStage fetch --no-tags origin $candidate
         if ($LASTEXITCODE -eq 0) {
-            $fetched = $true
-            break
+            & git -C $sourceStage cat-file -e "$HermesCommit^{commit}" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $fetched = $true
+                break
+            }
         }
     }
+    if (-not $fetched) {
+        throw "Could not fetch official commit $HermesCommit"
+    }
 }
-if (-not $fetched) {
-    throw "Could not fetch a complete official snapshot containing $HermesCommit"
-}
+
+# Windows cannot materialize upstream contributor metadata paths that differ
+# only by case. Exclude that metadata-only tree before checkout, matching the
+# target-side updater handoff hardening, so the staged worktree stays clean.
+$gitDir = Join-Path $sourceStage '.git'
+$gitInfo = Join-Path $gitDir 'info'
+New-Item -ItemType Directory -Force -Path $gitInfo | Out-Null
+& git -C $sourceStage config core.autocrlf false
+if ($LASTEXITCODE -ne 0) { throw 'Could not configure core.autocrlf for bundled checkout.' }
+& git -C $sourceStage config core.sparseCheckout true
+if ($LASTEXITCODE -ne 0) { throw 'Could not enable sparse checkout for bundled checkout.' }
+& git -C $sourceStage config core.sparseCheckoutCone false
+if ($LASTEXITCODE -ne 0) { throw 'Could not select non-cone sparse checkout mode.' }
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText((Join-Path $gitInfo 'sparse-checkout'), "/*`r`n!/contributors/`r`n", $utf8NoBom)
 
 & git -C $sourceStage checkout --detach $HermesCommit
 if ($LASTEXITCODE -ne 0) { throw "Could not checkout bundled Hermes commit $HermesCommit" }
+& git -C $sourceStage read-tree -mu HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Could not apply sparse checkout to bundled Hermes source.' }
 
 $head = (& git -C $sourceStage rev-parse HEAD | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $head -ne $HermesCommit) {
@@ -71,12 +88,15 @@ if ($LASTEXITCODE -ne 0 -or $origin -ne $officialOrigin) {
     throw "Bundled source origin mismatch: $origin"
 }
 
-# Fail closed on every mechanism that can make a repository depend on objects
-# outside the archive. A normal depth-1 clone has .git/shallow; that is safe.
-$gitDir = Join-Path $sourceStage '.git'
+# Fail closed on every mechanism that can make the shipped repository depend on
+# hidden external objects or truncated history.
 $alternates = Join-Path $gitDir 'objects\info\alternates'
 if (Test-Path -LiteralPath $alternates -PathType Leaf) {
     throw 'Bundled source repository unexpectedly contains an objects/info/alternates dependency.'
+}
+$shallowFile = Join-Path $gitDir 'shallow'
+if (Test-Path -LiteralPath $shallowFile -PathType Leaf) {
+    throw 'Bundled source repository is shallow; official Desktop update compatibility requires full history.'
 }
 foreach ($key in @('extensions.partialClone', 'remote.origin.promisor', 'remote.origin.partialclonefilter')) {
     $value = (& git -C $sourceStage config --local --get $key 2>$null | Out-String).Trim()
@@ -89,18 +109,10 @@ if ($promisorPacks.Count -gt 0) {
     throw "Bundled source repository contains promisor pack metadata: $(($promisorPacks.Name) -join ', ')"
 }
 
-# `git fsck` plus explicit object reads guarantee the current release snapshot
-# does not rely on missing objects. This is the invariant the previous local
-# clone failed to enforce.
+# Full fsck verifies the history/object database that the official updater will
+# inherit, not merely the current release tree.
 & git -C $sourceStage fsck --full --no-reflogs
-if ($LASTEXITCODE -ne 0) { throw 'Bundled source repository failed git fsck.' }
-& git -C $sourceStage rev-list --objects HEAD | ForEach-Object {
-    $oid = ($_ -split ' ', 2)[0]
-    if ($oid) {
-        & git -C $sourceStage cat-file -e $oid 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "Bundled source is missing reachable object $oid" }
-    }
-}
+if ($LASTEXITCODE -ne 0) { throw 'Bundled full-history source repository failed git fsck.' }
 $status = (& git -C $sourceStage status --porcelain=v1 --untracked-files=no | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not verify bundled source worktree status.' }
 if ($status) { throw "Bundled source worktree is not clean:`n$status" }
@@ -112,7 +124,7 @@ if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) {
     $tar = (Get-Command tar.exe -ErrorAction Stop).Source
 }
 if (Test-Path -LiteralPath $sourceArchive) { Remove-Item -LiteralPath $sourceArchive -Force }
-Write-Host 'Rebuilding hermes-source.tar.gz from self-contained checkout...'
+Write-Host 'Rebuilding hermes-source.tar.gz from full-history checkout...'
 & $tar -czf $sourceArchive -C $sourceStage .
 if ($LASTEXITCODE -ne 0) { throw 'Failed to rebuild hermes-source.tar.gz.' }
 
@@ -122,7 +134,8 @@ if ($entry.Count -ne 1) { throw 'manifest.json does not contain exactly one herm
 $sourceFile = Get-Item -LiteralPath $sourceArchive
 $entry[0].bytes = [int64]$sourceFile.Length
 $entry[0].sha256 = (Get-FileHash -LiteralPath $sourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+$manifest | Add-Member -NotePropertyName git_history -NotePropertyValue 'full' -Force
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 
-Write-Host "Bundled source checkout hardened: $HermesCommit"
+Write-Host "Bundled full-history source checkout hardened: $HermesCommit"
 Write-Host "Source archive: $($sourceFile.Length) bytes, sha256=$($entry[0].sha256)"
