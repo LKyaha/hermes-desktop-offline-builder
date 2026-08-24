@@ -1,0 +1,41 @@
+name: Cleanup superseded broken offline releases
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cleanup-broken-releases.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove all pre-fix offline Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo 'Published releases before cleanup:'
+          gh release list --limit 100 || true
+
+          mapfile -t tags < <(gh release list --limit 100 --json tagName --jq '.[].tagName | select(startswith("offline-"))')
+
+          if (( ${#tags[@]} == 0 )); then
+            echo 'No offline-* Releases exist; nothing to remove.'
+            exit 0
+          fi
+
+          echo 'Removing superseded offline Releases (Git tags are intentionally preserved):'
+          for tag in "${tags[@]}"; do
+            echo "  - $tag"
+            gh release delete "$tag" --yes
+          done
+
+          echo 'Remaining published releases:'
+          gh release list --limit 100 || true
