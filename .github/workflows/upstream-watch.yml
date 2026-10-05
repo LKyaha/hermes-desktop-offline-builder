@@ -9,6 +9,7 @@ on:
     paths:
       - '.github/workflows/upstream-watch.yml'
       - '.github/workflows/publish-validated-release.yml'
+      - '.github/contract/**'
 
 permissions:
   contents: read
@@ -28,17 +29,17 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Resolve desired immutable release and dispatch only when missing
+      - name: Resolve latest stable upstream release
+        id: upstream
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
           upstream_ref="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)"
           if [[ -z "$upstream_ref" || "$upstream_ref" == 'null' ]]; then
-            echo 'Could not resolve the latest NousResearch/hermes-agent release.' >&2
+            echo 'Could not resolve the latest NousResearch/hermes-agent stable release.' >&2
             exit 1
           fi
 
@@ -48,20 +49,59 @@ jobs:
             exit 1
           fi
 
+          echo "ref=$upstream_ref" >> "$GITHUB_OUTPUT"
+          echo "sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream stable release: $upstream_ref"
+          echo "Upstream commit: $upstream_sha"
+
+      - name: Gate on upstream installer contract
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+        run: |
+          set -euo pipefail
+
+          installer="$RUNNER_TEMP/hermes-install.ps1"
+          summary="$RUNNER_TEMP/hermes-contract-summary.md"
+
+          gh api "repos/NousResearch/hermes-agent/contents/scripts/install.ps1?ref=$UPSTREAM_REF"             --jq .content | base64 --decode > "$installer"
+
+          set +e
+          python3 .github/contract/check-installer-contract.py             --installer "$installer"             --contract .github/contract/hermes-installer-contract.json             --upstream-ref "$UPSTREAM_REF"             --summary "$summary"
+          gate_code=$?
+          set -e
+
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$gate_code" != '0' ]]; then
+            echo "Upstream installer contract changed for $UPSTREAM_REF; refusing to allocate the Windows runner." >&2
+            echo "Review the contract summary, update the offline adapter if needed, then deliberately update the accepted contract baseline." >&2
+            exit "$gate_code"
+          fi
+
+      - name: Resolve desired immutable release and dispatch only when missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+
           builder_sha="$(git rev-parse HEAD)"
           builder_id="$({
-            git ls-tree -r HEAD -- .github/workflows scripts installer
+            git ls-tree -r HEAD -- .github/workflows .github/contract scripts installer
           } | sha256sum | cut -c1-12)"
           if [[ -z "$builder_id" ]]; then
             echo 'Could not compute builder content fingerprint.' >&2
             exit 1
           fi
 
-          safe_ref="$(printf '%s' "$upstream_ref" | sed 's#[\\/:*?"<>|]#-#g')"
-          release_tag="offline-${safe_ref}-u${upstream_sha:0:12}-b${builder_id}"
+          safe_ref="$(printf '%s' "$UPSTREAM_REF" | sed 's#[\\/:*?"<>|]#-#g')"
+          release_tag="offline-${safe_ref}-u${UPSTREAM_SHA:0:12}-b${builder_id}"
 
-          echo "Latest upstream release: $upstream_ref"
-          echo "Upstream commit: $upstream_sha"
           echo "Builder commit: $builder_sha"
           echo "Builder content fingerprint: $builder_id"
           echo "Expected immutable release: $release_tag"
@@ -78,7 +118,5 @@ jobs:
             exit 0
           fi
 
-          echo 'Exact validated release is missing; dispatching full Windows validation/build.'
-          gh workflow run offline-build.yml \
-            --ref main \
-            -f hermes_ref="$upstream_ref"
+          echo 'Contract accepted and exact validated release is missing; dispatching full Windows validation/build.'
+          gh workflow run offline-build.yml             --ref main             -f hermes_ref="$UPSTREAM_REF"
