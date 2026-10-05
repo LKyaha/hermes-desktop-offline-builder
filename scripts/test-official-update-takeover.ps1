@@ -89,6 +89,43 @@ $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $TestHome 'ms-playwright'
 $env:npm_config_engine_strict = 'false'
 $env:CSC_IDENTITY_AUTO_DISCOVERY = 'false'
 
+# The official Windows updater may restart the gateway by direct-spawning a
+# checkout-owned Python process when no gateway service is installed (the
+# normal state in this isolated CI fixture). That process can outlive the
+# updater and keep Hermes runtime lease files open, which in turn makes the
+# following build-tree cleanup fail on Windows. The lifecycle test owns every
+# process launched from TestHome, so tear those fixture processes down before
+# returning to the workflow.
+function Stop-HermesTakeoverFixtureProcesses {
+    $normalizedHome = [System.IO.Path]::GetFullPath($TestHome).TrimEnd('\\')
+    $matches = @()
+    try {
+        $matches = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            if ([int]$_.ProcessId -eq $PID) { return $false }
+            $exe = [string]$_.ExecutablePath
+            $cmd = [string]$_.CommandLine
+            (($exe -and $exe.StartsWith($normalizedHome, [System.StringComparison]::OrdinalIgnoreCase)) -or
+             ($cmd -and $cmd.IndexOf($normalizedHome, [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
+        })
+    } catch {
+        Write-Warning "Could not enumerate takeover fixture processes: $($_.Exception.Message)"
+        return
+    }
+
+    foreach ($proc in $matches) {
+        try {
+            Write-Host "Stopping takeover fixture process PID $($proc.ProcessId): $($proc.Name)"
+            Stop-Process -Id ([int]$proc.ProcessId) -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not stop fixture PID $($proc.ProcessId): $($_.Exception.Message)"
+        }
+    }
+
+    # Give Windows a moment to release file/registry handles held by the killed
+    # process tree before the next workflow step removes offline-test-home.
+    if ($matches.Count -gt 0) { Start-Sleep -Seconds 2 }
+}
+
 # Strict-offline knobs must never have leaked into the persistent user
 # environment. If they did, the installed app could never follow official
 # updates after reboot/login even though this CI process clears its own copy.
@@ -216,4 +253,5 @@ try {
     }
 } finally {
     Pop-Location
+    Stop-HermesTakeoverFixtureProcesses
 }
