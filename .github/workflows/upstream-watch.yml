@@ -81,5 +81,4 @@ jobs:
           echo 'Exact validated release is missing; dispatching full Windows validation/build.'
           gh workflow run offline-build.yml \
             --ref main \
-            -f hermes_ref="$upstream_ref" \
-            -f publish=false
+            -f hermes_ref="$upstream_ref"
