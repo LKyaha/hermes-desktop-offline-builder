@@ -92,7 +92,7 @@ jobs:
 
           builder_sha="$(git rev-parse HEAD)"
           builder_id="$({
-            git ls-tree -r HEAD -- .github/workflows .github/contract scripts installer
+            git ls-tree -r HEAD -- .github/workflows/offline-build.yml scripts installer
           } | sha256sum | cut -c1-12)"
           if [[ -z "$builder_id" ]]; then
             echo 'Could not compute builder content fingerprint.' >&2
