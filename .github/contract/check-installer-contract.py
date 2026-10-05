@@ -11,8 +11,8 @@ STAGE_END = "# Stage workers"
 NETWORK_PATTERNS = {
     "Invoke-WebRequest": r"\bInvoke-WebRequest\b",
     "Invoke-RestMethod": r"\bInvoke-RestMethod\b",
-    "irm": r"(?i)(?:^|[;&|\s])irm\s+https?://",
-    "iwr": r"(?i)(?:^|[;&|\s])iwr\s+https?://",
+    "irm": r"(?i)\birm\s+https?://",
+    "iwr": r"(?i)\biwr\s+https?://",
     "curl": r"(?i)\bcurl(?:\.exe)?\b",
     "wget": r"(?i)\bwget(?:\.exe)?\b",
     "Start-BitsTransfer": r"\bStart-BitsTransfer\b",
