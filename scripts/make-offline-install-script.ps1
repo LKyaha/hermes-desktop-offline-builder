@@ -140,7 +140,32 @@ function Initialize-HermesOfflineEnvironment {
         [Environment]::SetEnvironmentVariable('HERMES_GIT_BASH_PATH', $managedBash, 'User')
     }
 
-    $env:UV_PYTHON_INSTALL_DIR = Join-Path $HermesHome 'python'
+    # Upstream v2026.9.x moved Hermes-managed Python from a HermesHome-level
+    # store to a checkout-private store under <InstallDir>\.hermes-runtime\python.
+    # The offline payload still carries the relocatable uv-managed interpreter
+    # as HermesHome\python after managed-runtime extraction. Once the repository
+    # stage has materialized InstallDir, mirror that interpreter into the exact
+    # location the current upstream Test-Python/Resolve-AvailablePythonVersion
+    # accepts. This is done on every fresh stage invocation, so the python stage
+    # sees it even though repository and python execute in separate powershells.
+    $bundledPythonRoot = Join-Path $HermesHome 'python'
+    $checkoutPythonRoot = Join-Path $InstallDir '.hermes-runtime\python'
+    if ((Test-Path -LiteralPath (Join-Path $InstallDir '.git') -PathType Container) -and
+        (Test-Path -LiteralPath $bundledPythonRoot -PathType Container)) {
+        $checkoutRuntimeRoot = Split-Path -Parent $checkoutPythonRoot
+        New-Item -ItemType Directory -Force -Path $checkoutRuntimeRoot | Out-Null
+
+        $hasCheckoutPython = @(Get-ChildItem -LiteralPath $checkoutPythonRoot -Directory -ErrorAction SilentlyContinue).Count -gt 0
+        if (-not $hasCheckoutPython) {
+            if (Test-Path -LiteralPath $checkoutPythonRoot) {
+                Remove-Item -LiteralPath $checkoutPythonRoot -Recurse -Force
+            }
+            Write-Info "Staging bundled managed Python into checkout-private runtime..."
+            Copy-Item -LiteralPath $bundledPythonRoot -Destination $checkoutPythonRoot -Recurse -Force
+        }
+    }
+
+    $env:UV_PYTHON_INSTALL_DIR = $checkoutPythonRoot
     $env:UV_CACHE_DIR = Join-Path $HermesHome 'uv-cache'
     $env:UV_TOOL_DIR = Join-Path $HermesHome 'uv-tools'
     $env:UV_OFFLINE = '1'
