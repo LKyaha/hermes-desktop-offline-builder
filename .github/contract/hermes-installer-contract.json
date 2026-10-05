@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "accepted_from_upstream_ref": "v2026.9.24",
+  "purpose": "Fail closed before allocating a Windows runner when Hermes Windows installer assumptions used by the offline builder change.",
+  "expected": {
+    "stage_names": [
+      "uv",
+      "git",
+      "node",
+      "system-packages",
+      "repository",
+      "python",
+      "venv",
+      "dependencies",
+      "node-deps",
+      "desktop",
+      "path",
+      "config-templates",
+      "platform-sdks",
+      "bootstrap-marker",
+      "configure",
+      "gateway"
+    ],
+    "python_version": "3.11",
+    "python_fallback_versions": [
+      "3.12",
+      "3.13",
+      "3.10"
+    ],
+    "node_major": "22",
+    "required_functions": [
+      "Install-Uv",
+      "Install-Repository",
+      "Install-Desktop",
+      "Install-DesktopVoiceDeps",
+      "Install-BrowserUseCli",
+      "Install-CuaDriver",
+      "Install-NodeDeps",
+      "Install-AgentBrowser",
+      "Test-CuaDriverRuntimeContract",
+      "New-DesktopShortcuts",
+      "Initialize-ManagedPythonEnvironment",
+      "Resolve-AvailablePythonVersion",
+      "Test-Python"
+    ],
+    "network_primitives": [
+      "Invoke-RestMethod",
+      "Invoke-WebRequest",
+      "irm"
+    ],
+    "url_hosts": [
+      "astral.sh",
+      "docs.astral.sh",
+      "git-scm.com",
+      "github.com",
+      "hermes-agent.nousresearch.com",
+      "nodejs.org",
+      "npmmirror.com",
+      "raw.githubusercontent.com"
+    ],
+    "key_env_vars": [
+      "AGENT_BROWSER_EXECUTABLE_PATH",
+      "CSC_IDENTITY_AUTO_DISCOVERY",
+      "ELECTRON_CACHE",
+      "ELECTRON_MIRROR",
+      "electron_config_cache",
+      "HERMES_GIT_BASH_PATH",
+      "HERMES_HOME",
+      "npm_config_min_release_age",
+      "UV_INSTALL_DIR",
+      "UV_MANAGED_PYTHON",
+      "UV_NO_CONFIG",
+      "UV_PROJECT_ENVIRONMENT",
+      "UV_PYTHON",
+      "UV_PYTHON_INSTALL_BIN",
+      "UV_PYTHON_INSTALL_DIR",
+      "UV_PYTHON_INSTALL_REGISTRY",
+      "UV_TOOL_BIN_DIR",
+      "WIN_CSC_KEY_PASSWORD",
+      "WIN_CSC_LINK"
+    ],
+    "managed_python_relative_path": ".hermes-runtime\\python",
+    "managed_uv_relative_path": "bin\\uv.exe",
+    "stage_marker_present": true
+  }
+}
