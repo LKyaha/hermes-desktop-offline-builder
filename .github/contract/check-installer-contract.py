@@ -39,13 +39,48 @@ def quoted_setting(text: str, name: str):
     m = re.search(r"\$" + re.escape(name) + r"\s*=\s*[\"']([^\"']+)[\"']", text)
     return m.group(1) if m else None
 
-def extract_contract(text: str):
-    code = strip_comments(text)
+def _pm_packages(pm_lock):
+    if not pm_lock:
+        return {}
+    return pm_lock.get("packages", {}) if isinstance(pm_lock, dict) else {}
 
+
+def _artifact_urls(value):
+    if isinstance(value, dict):
+        url = value.get("url")
+        if isinstance(url, str):
+            yield url
+        for child in value.values():
+            yield from _artifact_urls(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _artifact_urls(child)
+
+
+def extract_contract(text: str, pm_lock=None):
+    code = strip_comments(text)
+    packages = _pm_packages(pm_lock)
+
+    # Old installers surrounded the authoritative stage table with comment
+    # markers. Newer installers keep the same $Stages authority but dropped
+    # those comments and append the final "complete" stage separately.
     start = text.find(STAGE_START)
     end = text.find(STAGE_END, start + 1) if start >= 0 else -1
-    stage_block = text[start:end] if start >= 0 and end > start else ""
-    stages = re.findall(r"\bName\s*=\s*[\"']([^\"']+)[\"']", stage_block)
+    if start >= 0 and end > start:
+        stage_block = text[start:end]
+    else:
+        m = re.search(
+            r"(?is)\$Stages\s*=\s*@\((.*?)\)\s*(?=\$Stages\s*\+=|function\s+)",
+            text,
+        )
+        stage_block = m.group(1) if m else ""
+    stages = re.findall(r"(?i)\bname\s*=\s*[\"']([^\"']+)[\"']", stage_block)
+    for appended in re.findall(
+        r"(?is)\$Stages\s*\+=\s*@\{(.*?)\}", text
+    ):
+        m = re.search(r"(?i)\bname\s*=\s*[\"']([^\"']+)[\"']", appended)
+        if m:
+            stages.append(m.group(1))
 
     funcs = sorted(set(re.findall(r"(?im)^\s*function\s+([A-Za-z0-9_-]+)\b", code)))
 
@@ -54,9 +89,15 @@ def extract_contract(text: str):
     if fallback_m:
         fallbacks = re.findall(r"[\"']([^\"']+)[\"']", fallback_m.group(1))
 
-    hosts = sorted(set(
+    host_values = {
         h.lower() for h in re.findall(r"https?://([A-Za-z0-9.-]+)", code, flags=re.I)
-    ))
+    }
+    for package in packages.values():
+        for url in _artifact_urls(package.get("artifacts", {})):
+            m = re.match(r"(?i)https?://([^/]+)", url)
+            if m:
+                host_values.add(m.group(1).lower())
+    hosts = sorted(host_values)
 
     env_vars = sorted(set(
         name for name in re.findall(r"\$env:([A-Za-z0-9_]+)", code)
@@ -86,11 +127,29 @@ def extract_contract(text: str):
     if m:
         managed_uv = m.group(1)
 
+    python_policy = quoted_setting(code, "PythonVersion")
+    node_policy = quoted_setting(code, "NodeVersion")
+    if packages:
+        py = packages.get("python", {}).get("version")
+        if py:
+            py_base = str(py).split("+", 1)[0]
+            parts = py_base.split(".")
+            python_policy = ".".join(parts[:2]) if len(parts) >= 2 else py_base
+            # PM owns one exact Python pin rather than the old minor fallback ladder.
+            fallbacks = []
+            managed_python = f"tools\\python-{py}-<target>"
+        node = packages.get("node", {}).get("version")
+        if node:
+            node_policy = str(node).split(".", 1)[0]
+        uv = packages.get("uv", {}).get("version")
+        if uv:
+            managed_uv = f"tools\\uv-{uv}-<target>\\uv.exe"
+
     return {
         "stage_names": stages,
-        "python_version": quoted_setting(code, "PythonVersion"),
+        "python_version": python_policy,
         "python_fallback_versions": fallbacks,
-        "node_major": quoted_setting(code, "NodeVersion"),
+        "node_major": node_policy,
         "required_functions_present": funcs,
         "network_primitives": network_primitives,
         "url_hosts": hosts,
@@ -149,12 +208,16 @@ def main():
     ap.add_argument("--installer", required=True)
     ap.add_argument("--contract", required=True)
     ap.add_argument("--upstream-ref", required=True)
+    ap.add_argument("--pm-lock")
     ap.add_argument("--summary")
     args = ap.parse_args()
 
     installer = Path(args.installer).read_text(encoding="utf-8-sig")
+    pm_lock = None
+    if args.pm_lock:
+        pm_lock = json.loads(Path(args.pm_lock).read_text(encoding="utf-8"))
     baseline = json.loads(Path(args.contract).read_text(encoding="utf-8"))
-    actual = extract_contract(installer)
+    actual = extract_contract(installer, pm_lock)
     expected = baseline["expected"]
     problems = compare(actual, expected)
 
