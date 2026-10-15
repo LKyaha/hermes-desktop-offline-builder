@@ -63,12 +63,21 @@ jobs:
           set -euo pipefail
 
           installer="$RUNNER_TEMP/hermes-install.ps1"
+          pm_lock="$RUNNER_TEMP/hermes-pm-lock.json"
           summary="$RUNNER_TEMP/hermes-contract-summary.md"
 
-          gh api "repos/NousResearch/hermes-agent/contents/scripts/install.ps1?ref=$UPSTREAM_REF"             --jq .content | base64 --decode > "$installer"
+          gh api "repos/NousResearch/hermes-agent/contents/scripts/install.ps1?ref=$UPSTREAM_REF" \
+            --jq .content | base64 --decode > "$installer"
+          gh api "repos/NousResearch/hermes-agent/contents/pm/lock.json?ref=$UPSTREAM_REF" \
+            --jq .content | base64 --decode > "$pm_lock"
 
           set +e
-          python3 .github/contract/check-installer-contract.py             --installer "$installer"             --contract .github/contract/hermes-installer-contract.json             --upstream-ref "$UPSTREAM_REF"             --summary "$summary"
+          python3 .github/contract/check-installer-contract.py \
+            --installer "$installer" \
+            --pm-lock "$pm_lock" \
+            --contract .github/contract/hermes-installer-contract.json \
+            --upstream-ref "$UPSTREAM_REF" \
+            --summary "$summary"
           gate_code=$?
           set -e
 
